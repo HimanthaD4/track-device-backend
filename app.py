@@ -1,4 +1,4 @@
-# app.py - Updated for Multi-Device Support
+# app.py - UPDATED WITH DEVICE_ID FIXES
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_bcrypt import Bcrypt
@@ -29,20 +29,20 @@ app.config['CORS_HEADERS'] = 'Content-Type,Authorization'
 CORS(app, 
      resources={r"/*": {"origins": "*"}},
      supports_credentials=True,
-     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+     allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Device-ID"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
 # Enhanced WebSocket configuration for Render.com
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode='threading',  # CHANGE TO THREADING for Render.com
+    async_mode='threading',
     ping_timeout=60,
     ping_interval=25,
     max_http_buffer_size=1e8,
     transports=['websocket', 'polling'],
-    logger=False,
-    engineio_logger=False
+    logger=True,  # ✅ Enable for debugging
+    engineio_logger=True  # ✅ Enable for debugging
 )
 
 bcrypt = Bcrypt(app)
@@ -64,11 +64,11 @@ devices_collection = db.devices
 locations_collection = db.locations
 university_collection = db.university
 
-# ✅ FIX 1: Add collections for multi-device tracking
+# ✅ FIX: Add collections for multi-device tracking
 device_connections_collection = db.device_connections
 device_locations_collection = db.device_locations_live
 
-# Create indexes with error handling
+# Create indexes
 try:
     devices_collection.create_index([('device_id', 1)], unique=True, background=True)
     devices_collection.create_index([('user_email', 1)], background=True)
@@ -79,7 +79,7 @@ try:
     locations_collection.create_index([('device_id', 1), ('timestamp', -1)], background=True)
     university_collection.create_index([('user_email', 1)], unique=True, background=True)
     
-    # ✅ FIX 2: Indexes for multi-device
+    # Indexes for multi-device
     device_connections_collection.create_index([('device_id', 1)], unique=True, background=True)
     device_connections_collection.create_index([('user_email', 1)], background=True)
     device_connections_collection.create_index([('socket_id', 1)], background=True)
@@ -97,15 +97,15 @@ user_models = {}
 training_threads = {}
 model_lock = threading.Lock()
 
-# ✅ FIX 3: Multi-device tracking structures
+# Multi-device tracking structures
 connected_devices = {}  # device_id -> socket_id
 user_devices = {}       # user_email -> set(device_id)
 device_locations = {}   # device_id -> location_data
 
-# SMART LOCATION VALIDATION SETTINGS - RELAXED FOR DEMO
-HIGH_ACCURACY_THRESHOLD = 10.0  # Increased from 3.0 for better anchor points
-MAX_ACCEPTABLE_ACCURACY = 100.0  # Increased from 50.0 for better demo
-MAX_POSITION_DRIFT = 10.0  # Increased from 3.0 for smoother movement
+# SMART LOCATION VALIDATION SETTINGS
+HIGH_ACCURACY_THRESHOLD = 10.0
+MAX_ACCEPTABLE_ACCURACY = 100.0
+MAX_POSITION_DRIFT = 10.0
 
 # UNIVERSITY CONFIGURATION
 UNIVERSITY_SIZE = 0.000324
@@ -118,9 +118,42 @@ SECTION_CONFIGS = [
     {'name': 'Admin Block', 'color': '#1abc9c', 'row': 2, 'col': 1}
 ]
 
-# ✅ FIX 4: Cache to prevent duplicate location processing
+# Cache to prevent duplicate location processing
 last_location_cache = {}
-CACHE_TTL = 2  # Cache entries valid for 2 seconds
+CACHE_TTL = 2
+
+def extract_device_id_from_request():
+    """Extract device_id from WebSocket request"""
+    try:
+        # Method 1: From query params
+        device_id = request.args.get('device_id')
+        if device_id:
+            return device_id
+        
+        # Method 2: From auth (for Socket.IO v4+)
+        if hasattr(request, 'auth'):
+            return request.auth.get('device_id') if request.auth else None
+            
+        # Method 3: From headers
+        device_id = request.headers.get('X-Device-ID')
+        if device_id:
+            return device_id
+            
+        return None
+        
+    except Exception as e:
+        print(f"⚠️ Error extracting device_id: {e}")
+        return None
+
+def validate_device_id(device_id):
+    """Validate device_id is not null or invalid"""
+    if not device_id:
+        return False
+    if device_id == 'null' or device_id == 'undefined' or device_id == 'None':
+        return False
+    if len(device_id) < 5:  # Too short to be valid
+        return False
+    return True
 
 def generate_university_layout(center_lat, center_lon):
     sections = []
@@ -206,9 +239,6 @@ def detect_browser(user_agent):
     else:
         return 'Unknown'
 
-# ✅ FIX 5: REMOVE generate_device_fingerprint - Use device_id from frontend
-# Frontend now generates UUID and sends it
-
 def calculate_distance(lat1, lon1, lat2, lon2):
     R = 6371000
     phi1 = math.radians(lat1)
@@ -246,11 +276,13 @@ def constrain_location_to_radius(new_lat, new_lon, anchor_lat, anchor_lon, max_r
     return constrained_lat, constrained_lon, distance
 
 def validate_and_constrain_location(device_id, latitude, longitude, accuracy):
-    """RELAXED VALIDATION FOR DEMO - Accepts more locations"""
+    """RELAXED VALIDATION FOR DEMO"""
+    if not validate_device_id(device_id):
+        print(f"❌ INVALID device_id in validation: {device_id}")
+        return None, None, None, False, "invalid_device_id"
+    
     if accuracy > MAX_ACCEPTABLE_ACCURACY:
-        print(f"⚠️ WARNING: Device {device_id[:8]}... accuracy {accuracy:.1f}m (threshold: {MAX_ACCEPTABLE_ACCURACY}m)")
-        # Still accept but log warning for demo
-        # return None, None, None, False, "accuracy_too_low"
+        print(f"⚠️ WARNING: Device {device_id[:8]}... accuracy {accuracy:.1f}m")
     
     last_location = locations_collection.find_one(
         {'device_id': device_id}, 
@@ -270,7 +302,7 @@ def validate_and_constrain_location(device_id, latitude, longitude, accuracy):
             constrained_lat, constrained_lon, actual_distance = constrain_location_to_radius(
                 latitude, longitude, anchor_lat, anchor_lon, MAX_POSITION_DRIFT
             )
-            print(f"🔒 CONSTRAINED: Device {device_id[:8]}... moved {actual_distance:.1f}m (limited to {MAX_POSITION_DRIFT}m)")
+            print(f"🔒 CONSTRAINED: Device {device_id[:8]}... moved {actual_distance:.1f}m")
             return constrained_lat, constrained_lon, accuracy, True, "constrained_to_radius"
         else:
             print(f"✅ ACCEPTED: Device {device_id[:8]}... moved {distance:.1f}m")
@@ -290,7 +322,6 @@ def start_ml_training(user_email):
         model = user_models[user_email]
         model.training_start_time = datetime.datetime.utcnow()
     
-    # Update training status
     behavior_analyzer.update_training_status(user_email, {
         'training_started': datetime.datetime.utcnow(),
         'is_training': True,
@@ -299,7 +330,6 @@ def start_ml_training(user_email):
         'last_update': datetime.datetime.utcnow()
     })
     
-    # Send training started notification
     try:
         socketio.emit('ml_status_update', {
             'is_training': True,
@@ -322,15 +352,12 @@ def check_and_train_model(user_email):
     
     training_status = behavior_analyzer.get_training_status(user_email)
     
-    # Check if already trained
     if training_status and training_status.get('is_trained'):
-        # Try to load saved model
         model_path = f"models/{user_email}_model.pkl"
         if model.load_model(model_path):
             print(f"📂 Loaded trained model for {user_email}")
             return True
         else:
-            # Model file missing, retrain
             behavior_analyzer.update_training_status(user_email, {
                 'is_training': True,
                 'is_trained': False,
@@ -340,12 +367,10 @@ def check_and_train_model(user_email):
     user = users_collection.find_one({'email': user_email})
     device_count = len(user.get('devices', [])) if user else 0
     
-    # Need at least 2 devices
     if device_count < 2:
-        print(f"⏸️ ML Training paused for {user_email}: Only {device_count} device(s) registered")
+        print(f"⏸️ ML Training paused for {user_email}: Only {device_count} device(s)")
         return False
     
-    # Check if training should start
     if not training_status:
         start_ml_training(user_email)
         return False
@@ -355,17 +380,14 @@ def check_and_train_model(user_email):
         current_time = datetime.datetime.utcnow()
         elapsed_minutes = (current_time - training_started).total_seconds() / 60
         
-        # Collect training data during the training period
         behavior_data = behavior_analyzer.get_training_data(user_email, limit=200)
         sample_count = len(behavior_data)
         
-        # Update training status with current sample count
         behavior_analyzer.update_training_status(user_email, {
             'training_samples': sample_count,
             'last_update': current_time
         })
         
-        # Send progress update
         try:
             socketio.emit('ml_training_progress', {
                 'samples': sample_count,
@@ -376,27 +398,22 @@ def check_and_train_model(user_email):
         except Exception as e:
             print(f"⚠️ Could not emit training progress: {e}")
         
-        # Train when we have enough samples OR 5 minutes have passed
         if sample_count >= 30 or elapsed_minutes >= 5:
             print(f"🤖 Training ML model for {user_email} with {sample_count} samples...")
             
-            # Also get device patterns
             device_patterns = {}
             for device_id in user.get('devices', []):
                 pattern = behavior_analyzer.get_device_pattern(user_email, device_id)
                 if pattern:
                     device_patterns[device_id] = pattern
             
-            # Train the model
             success, message = model.train_model(behavior_data, device_patterns)
             
             if success:
-                # Save model to disk
                 model_path = f"models/{user_email}_model.pkl"
                 os.makedirs("models", exist_ok=True)
                 model.save_model(model_path)
                 
-                # Update training status
                 behavior_analyzer.update_training_status(user_email, {
                     'is_training': False,
                     'is_trained': True,
@@ -408,7 +425,6 @@ def check_and_train_model(user_email):
                 
                 print(f"✅ ML Model trained successfully for {user_email}")
                 
-                # Send completion notification
                 try:
                     socketio.emit('ml_training_complete', {
                         'message': 'Security system activated!',
@@ -423,7 +439,6 @@ def check_and_train_model(user_email):
                 print(f"❌ ML Training failed for {user_email}: {message}")
                 return False
         else:
-            # Still collecting data
             remaining_samples = max(0, 30 - sample_count)
             print(f"⏳ ML Training for {user_email}: {sample_count}/30 samples")
             return False
@@ -435,14 +450,24 @@ def analyze_device_behavior(user_email, device_locations):
     if len(device_locations) < 2:
         return None
     
+    # ✅ CRITICAL FIX: Validate all device IDs before processing
+    valid_device_locations = {}
+    for dev_id, location in device_locations.items():
+        if validate_device_id(dev_id):
+            valid_device_locations[dev_id] = location
+        else:
+            print(f"⚠️ Skipping invalid device_id in ML analysis: {dev_id}")
+    
+    if len(valid_device_locations) < 2:
+        return None
+    
     university_data = university_collection.find_one({'user_email': user_email})
     if not university_data or 'sections' not in university_data:
         return None
     
     sections = university_data['sections']
-    device_list = list(device_locations.values())
+    device_list = list(valid_device_locations.values())
     
-    # ✅ FIX 6: Check if devices have moved meaningfully before analysis
     meaningful_movement = False
     for device in device_list:
         last_loc = locations_collection.find_one(
@@ -455,7 +480,7 @@ def analyze_device_behavior(user_email, device_locations):
                 last_loc['latitude'], last_loc['longitude'],
                 device['latitude'], device['longitude']
             )
-            if distance > 3.0:  # More than 3 meters movement
+            if distance > 3.0:
                 meaningful_movement = True
                 break
     
@@ -468,16 +493,19 @@ def analyze_device_behavior(user_email, device_locations):
             device1 = device_list[i]
             device2 = device_list[j]
             
+            # ✅ Validate device IDs again
+            if not validate_device_id(device1['device_id']) or not validate_device_id(device2['device_id']):
+                print(f"⚠️ Skipping invalid device pair: {device1['device_id']}, {device2['device_id']}")
+                continue
+            
             device1_section = detect_section(device1['latitude'], device1['longitude'], sections)
             device2_section = detect_section(device2['latitude'], device2['longitude'], sections)
             
             device1['current_section'] = device1_section
             device2['current_section'] = device2_section
             
-            # Analyze device pair behavior
             behavior_record = behavior_analyzer.analyze_device_pair(user_email, device1, device2)
             
-            # Check and train model if needed
             model_ready = check_and_train_model(user_email)
             
             if model_ready:
@@ -485,22 +513,19 @@ def analyze_device_behavior(user_email, device_locations):
                     if user_email in user_models:
                         model = user_models[user_email]
                         
-                        # Predict anomaly with detailed analysis
                         is_anomaly, confidence, message, anomaly_details = model.predict_anomaly(behavior_record)
                         
                         if is_anomaly:
                             print(f"🚨 ANOMALY DETECTED for {user_email}!")
-                            print(f"   Score: {anomaly_details['score']:.3f} (threshold: {anomaly_details['threshold']:.3f})")
+                            print(f"   Score: {anomaly_details['score']:.3f}")
                             print(f"   Device 1: {device1_section}")
                             print(f"   Device 2: {device2_section}")
                             print(f"   Distance: {behavior_record['distance_between_devices']:.1f}m")
                             print(f"   Confidence: {confidence:.2f}")
                             
-                            # Get individual device patterns for more context
                             device1_pattern = behavior_analyzer.get_device_pattern(user_email, device1['device_id'])
                             device2_pattern = behavior_analyzer.get_device_pattern(user_email, device2['device_id'])
                             
-                            # Check individual anomalies
                             device1_anomaly, device1_details = model.detect_individual_anomaly(
                                 {'section_id': behavior_analyzer.get_section_id(device1_section),
                                  'speed': behavior_record.get('movement_speed_device1', 0)},
@@ -517,7 +542,6 @@ def analyze_device_behavior(user_email, device_locations):
                                  'with_other_device': device1['device_id']}
                             )
                             
-                            # Prepare alert data
                             alert_data = {
                                 'message': 'Unusual device behavior detected!',
                                 'device1': device1['device_id'],
@@ -540,13 +564,11 @@ def analyze_device_behavior(user_email, device_locations):
                                 }
                             }
                             
-                            # Send comprehensive alert
                             try:
                                 socketio.emit('anomaly_alert', alert_data, room=user_email)
                             except Exception as e:
                                 print(f"⚠️ Could not emit anomaly alert: {e}")
                             
-                            # Also send individual alerts if needed
                             if device1_anomaly and device1_details.get('reasons'):
                                 try:
                                     socketio.emit('individual_anomaly', {
@@ -606,7 +628,7 @@ def serialize_document(document):
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,X-Socket-ID')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,X-Socket-ID,X-Device-ID')
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     response.headers.add('Access-Control-Allow-Credentials', 'true')
     response.headers.add('Access-Control-Max-Age', '86400')
@@ -614,40 +636,60 @@ def after_request(response):
 
 @socketio.on('connect')
 def handle_connect():
-    print(f'✅ Client connected: {request.sid}')
-    emit('connected', {'message': 'Connected to server', 'sid': request.sid})
+    try:
+        # ✅ CRITICAL FIX: Extract device_id from handshake
+        device_id = extract_device_id_from_request()
+        
+        if not device_id:
+            # Try to get from query string
+            device_id = request.args.get('device_id')
+        
+        if not device_id:
+            print(f'❌ Client connected without device_id: {request.sid}')
+            device_id = f"temp_{request.sid[:10]}"
+            print(f'⚠️ Assigned temporary device_id: {device_id}')
+        
+        print(f'✅ Client connected: {request.sid} | Device: {device_id[:12] if device_id else "null"}')
+        
+        # Store device_id in a way accessible to other handlers
+        from flask import session
+        session['device_id'] = device_id
+        
+        emit('connected', {
+            'message': 'Connected to server',
+            'sid': request.sid,
+            'device_id': device_id
+        })
+        
+    except Exception as e:
+        print(f'❌ Connect error: {e}')
+        emit('connection_error', {'message': str(e)})
 
 @socketio.on('disconnect')
 def handle_disconnect():
     print(f'⚠️ Client disconnected: {request.sid}')
     
-    # ✅ FIX 7: Clean up device connection on disconnect
     try:
-        # Find device associated with this socket
         connection = device_connections_collection.find_one({'socket_id': request.sid})
         if connection:
             device_id = connection['device_id']
             user_email = connection['user_email']
             
-            # Remove from active connections
             device_connections_collection.delete_one({'socket_id': request.sid})
-            print(f"🗑️ Removed connection for device {device_id[:8]}...")
+            print(f"🗑️ Removed connection for device {device_id[:8] if device_id else 'unknown'}...")
             
-            # Update device_locations to mark as offline
             device_locations_collection.update_one(
                 {'device_id': device_id},
                 {'$set': {'is_online': False, 'last_seen': datetime.datetime.utcnow()}},
                 upsert=True
             )
             
-            # Update in-memory tracking
             if device_id in connected_devices:
                 del connected_devices[device_id]
             
             if user_email in user_devices and device_id in user_devices[user_email]:
                 user_devices[user_email].remove(device_id)
             
-            # Notify other devices that this device went offline
             try:
                 socketio.emit('device_offline', {
                     'device_id': device_id,
@@ -667,17 +709,39 @@ def handle_error(e):
 def handle_join_room(data):
     try:
         user_email = data.get('user_email')
-        device_id = data.get('device_id')  # ✅ FIX 8: Get device_id from data
+        device_id = data.get('device_id')
         token = data.get('token')
+        
+        # ✅ CRITICAL FIX: If device_id not provided, try multiple sources
+        if not device_id or device_id == 'null':
+            # Try from WebSocket handshake
+            device_id = extract_device_id_from_request()
+            
+            # Try from existing connection
+            if not device_id:
+                connection = device_connections_collection.find_one({'socket_id': request.sid})
+                if connection:
+                    device_id = connection.get('device_id')
+            
+            # Try from session
+            if not device_id:
+                from flask import session
+                device_id = session.get('device_id')
+            
+            # Last resort: generate temporary
+            if not device_id or device_id == 'null':
+                device_id = f"temp_{request.sid[:10]}"
+                print(f"⚠️ Generated temporary device_id: {device_id}")
+        
+        # ✅ HARD VALIDATION
+        if not validate_device_id(device_id):
+            print(f"❌ JOIN ERROR: Invalid device_id: {device_id}")
+            emit('join_error', {'message': 'Invalid Device ID'})
+            return
         
         if not user_email:
             print("❌ No user_email provided for join_room")
             emit('join_error', {'message': 'User email required'})
-            return
-        
-        if not device_id:
-            print("❌ No device_id provided for join_room")
-            emit('join_error', {'message': 'Device ID required'})
             return
         
         # Verify token if provided
@@ -691,15 +755,15 @@ def handle_join_room(data):
                     return
             except Exception as e:
                 print(f"⚠️ Token verification failed: {e}")
-                # Still allow join for demo purposes
         
-        # ✅ FIX 9: Track device connection
+        # ✅ Track device connection
         device_connections_collection.update_one(
             {'device_id': device_id},
             {
                 '$set': {
                     'socket_id': request.sid,
                     'user_email': user_email,
+                    'device_id': device_id,
                     'connected_at': datetime.datetime.utcnow(),
                     'is_online': True
                 }
@@ -715,14 +779,14 @@ def handle_join_room(data):
         user_devices[user_email].add(device_id)
         
         join_room(user_email)
-        print(f'✅ Device {device_id[:8]}... for user {user_email} joined room')
+        print(f'✅ Device {device_id[:8] if device_id else "unknown"}... for user {user_email} joined room')
         emit('join_confirmation', {
             'message': f'Joined room for {user_email}',
             'user_email': user_email,
             'device_id': device_id
         })
         
-        # ✅ FIX 10: Update device_locations with connection info
+        # Update device_locations with connection info
         device_info = devices_collection.find_one({'device_id': device_id})
         device_name = device_info.get('device_name', 'Unknown Device') if device_info else 'Unknown Device'
         device_os = device_info.get('os', 'Unknown') if device_info else 'Unknown'
@@ -746,23 +810,23 @@ def handle_join_room(data):
         
         # Send all device locations for this user
         try:
-            # Get all devices for this user
             user = users_collection.find_one({'email': user_email})
             if user and 'devices' in user:
                 for dev_id in user['devices']:
-                    # Get latest location
+                    # ✅ Skip invalid device IDs
+                    if not validate_device_id(dev_id):
+                        continue
+                        
                     location = locations_collection.find_one(
                         {'device_id': dev_id},
                         sort=[('timestamp', -1)]
                     )
                     
                     if location:
-                        # Get device info
                         device = devices_collection.find_one({'device_id': dev_id})
                         device_name = device.get('device_name', 'Unknown') if device else 'Unknown'
                         device_os = device.get('os', 'Unknown') if device else 'Unknown'
                         
-                        # Check if device is online
                         is_online = dev_id in connected_devices
                         
                         broadcast_data = {
@@ -778,7 +842,6 @@ def handle_join_room(data):
                             'is_online': is_online
                         }
                         
-                        # Send to all devices in user room
                         socketio.emit('location_update', broadcast_data, room=user_email)
             
         except Exception as e:
@@ -798,7 +861,6 @@ def handle_join_room(data):
             except Exception as e:
                 print(f"⚠️ Could not emit ML status: {e}")
         else:
-            # Check if user has 2+ devices and should start training
             user = users_collection.find_one({'email': user_email})
             if user and len(user.get('devices', [])) >= 2:
                 try:
@@ -830,6 +892,30 @@ def handle_join_room(data):
 def handle_location_update(data):
     try:
         device_id = data.get('device_id')
+        
+        # ✅ CRITICAL FIX: If device_id missing, try to get from connection tracking
+        if not device_id or device_id == 'null':
+            # Try to find device_id from connection tracking
+            connection = device_connections_collection.find_one({'socket_id': request.sid})
+            if connection:
+                device_id = connection.get('device_id')
+                print(f"🔄 Using tracked device_id: {device_id[:8] if device_id else 'unknown'}...")
+            else:
+                # Try from session
+                from flask import session
+                device_id = session.get('device_id')
+                
+                if not device_id:
+                    print(f"❌ No device_id found for socket {request.sid}")
+                    emit('location_error', {'message': 'Device ID not found. Please reconnect.'})
+                    return
+        
+        # ✅ HARD GUARD: Prevent null device_id processing
+        if not validate_device_id(device_id):
+            print(f"❌ REJECTED: Invalid device_id: {device_id}")
+            emit('location_error', {'message': 'Invalid Device ID'})
+            return
+        
         print(f"📍 Received location update for device: {device_id[:8] if device_id else 'unknown'}")
         
         latitude = data.get('latitude')
@@ -849,7 +935,7 @@ def handle_location_update(data):
             print(f"❌ Invalid coordinate format: {e}")
             return
         
-        # ✅ FIX 11: Check cache for duplicate locations to prevent spam
+        # Check cache for duplicate locations
         cache_key = f"{device_id}_{user_email}"
         current_time = datetime.datetime.utcnow()
         
@@ -857,20 +943,18 @@ def handle_location_update(data):
             last_data, last_time = last_location_cache[cache_key]
             time_diff = (current_time - last_time).total_seconds()
             
-            # Check if this is the same location within 2 seconds
             if time_diff < CACHE_TTL:
                 last_lat, last_lon, last_acc = last_data
                 distance = calculate_distance(last_lat, last_lon, raw_lat, raw_lng)
                 
-                # If minimal movement (< 2m) and accuracy didn't improve, skip
                 if distance < 2.0 and acc >= last_acc:
-                    print(f"⏭️ Skipping duplicate location for {device_id[:8]}... (moved {distance:.1f}m)")
+                    print(f"⏭️ Skipping duplicate location for {device_id[:8] if device_id else 'unknown'}...")
                     return
         
         # Update cache
         last_location_cache[cache_key] = ((raw_lat, raw_lng, acc), current_time)
         
-        # Clean old cache entries (prevent memory leak)
+        # Clean old cache entries
         cache_keys_to_delete = []
         for key in last_location_cache.keys():
             if (current_time - last_location_cache[key][1]).total_seconds() > 10:
@@ -879,7 +963,7 @@ def handle_location_update(data):
         for key in cache_keys_to_delete:
             del last_location_cache[key]
         
-        # ✅ FIX 12: Update device_locations collection with real-time status
+        # Update device_locations collection
         device_info = devices_collection.find_one({'device_id': device_id})
         device_name = device_info.get('device_name', 'Unknown Device') if device_info else 'Unknown Device'
         device_os = device_info.get('os', 'Unknown') if device_info else 'Unknown'
@@ -906,9 +990,9 @@ def handle_location_update(data):
         
         if university_data and 'sections' in university_data:
             current_section = detect_section(validated_lat, validated_lng, university_data['sections'])
-            print(f"📌 Device {device_id[:8]} in section: {current_section}")
+            print(f"📌 Device {device_id[:8] if device_id else 'unknown'} in section: {current_section}")
         
-        # Store raw location immediately for faster response
+        # Store raw location
         raw_location_data = {
             'device_id': device_id,
             'latitude': raw_lat,
@@ -973,7 +1057,7 @@ def handle_location_update(data):
             }}
         )
         
-        # ✅ FIX 13: Update device_locations for real-time tracking
+        # Update device_locations for real-time tracking
         device_locations_collection.update_one(
             {'device_id': device_id},
             {
@@ -1022,14 +1106,13 @@ def handle_location_update(data):
         
         try:
             socketio.emit('location_update', broadcast_data, room=user_email)
-            print(f"✅ Location update sent for device {device_id[:8]}")
+            print(f"✅ Location update sent for device {device_id[:8] if device_id else 'unknown'}")
         except Exception as e:
             print(f"⚠️ Could not emit location update: {e}")
         
-        # ✅ FIX 14: Skip ML analysis for minimal movement
+        # ML analysis
         user = users_collection.find_one({'email': user_email})
         if user and len(user.get('devices', [])) >= 2:
-            # Check if this is meaningful movement
             last_meaningful_location = locations_collection.find_one(
                 {'device_id': device_id, 'validation_reason': {'$ne': 'raw_location'}},
                 sort=[('timestamp', -1)]
@@ -1037,7 +1120,6 @@ def handle_location_update(data):
             
             should_analyze = True
             if last_meaningful_location:
-                # Calculate distance from last meaningful location
                 distance_moved = calculate_distance(
                     last_meaningful_location.get('latitude', validated_lat),
                     last_meaningful_location.get('longitude', validated_lng),
@@ -1045,7 +1127,6 @@ def handle_location_update(data):
                     validated_lng
                 )
                 
-                # Skip ML if movement is less than 3 meters
                 if distance_moved < 3.0:
                     should_analyze = False
                     print(f"⏭️ Skipping ML analysis (minimal movement: {distance_moved:.1f}m)")
@@ -1053,6 +1134,10 @@ def handle_location_update(data):
             if should_analyze:
                 user_devices_locations = {}
                 for dev_id in user.get('devices', []):
+                    # ✅ Skip invalid device IDs
+                    if not validate_device_id(dev_id):
+                        continue
+                        
                     loc = locations_collection.find_one(
                         {'device_id': dev_id, 'validation_reason': {'$ne': 'raw_location'}},
                         sort=[('timestamp', -1)]
@@ -1077,13 +1162,11 @@ def health_check():
     try:
         client.admin.command('ping')
         
-        # Check ML models directory
         models_dir = 'models'
         model_count = 0
         if os.path.exists(models_dir):
             model_count = len([f for f in os.listdir(models_dir) if f.endswith('.pkl')])
         
-        # Check connected devices
         connected_count = len(connected_devices)
         
         return jsonify({
@@ -1098,7 +1181,8 @@ def health_check():
             'version': '1.0.0',
             'websocket_support': True,
             'cache_size': len(last_location_cache),
-            'multi_device_support': True
+            'multi_device_support': True,
+            'device_id_fix': 'APPLIED'  # ✅ Added to confirm fix
         }), 200
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
@@ -1109,7 +1193,7 @@ def register():
         data = request.json
         email = data.get('email')
         password = data.get('password')
-        device_id = data.get('device_id')  # ✅ FIX 15: Get device_id from frontend
+        device_id = data.get('device_id')
         device_info = data.get('device_info', {})
         
         if not email or not password:
@@ -1139,7 +1223,6 @@ def register():
         
         user.pop('password', None)
         
-        # ✅ FIX 16: If device_id provided, register the device
         if device_id:
             try:
                 device_os = device_info.get('os', 'Unknown')
@@ -1164,7 +1247,7 @@ def register():
                     {'$push': {'devices': device_id}}
                 )
                 
-                print(f"📱 Device registered during registration: {device_id[:8]}...")
+                print(f"📱 Device registered during registration: {device_id[:8] if device_id else 'unknown'}...")
             except Exception as e:
                 print(f"⚠️ Device registration during signup failed: {e}")
         
@@ -1184,7 +1267,7 @@ def login():
         data = request.json
         email = data.get('email')
         password = data.get('password')
-        device_id = data.get('device_id')  # ✅ FIX 17: Get device_id from frontend
+        device_id = data.get('device_id')
         device_info = data.get('device_info', {})
         
         if not email or not password:
@@ -1197,14 +1280,12 @@ def login():
         if not bcrypt.check_password_hash(user['password'], password):
             return jsonify({'error': 'Invalid credentials'}), 401
         
-        # ✅ FIX 18: Check if device exists or needs registration
         device_exists = False
         if device_id:
             device_exists = devices_collection.find_one({'device_id': device_id}) is not None
             
-            # If device doesn't exist, we'll need to register it later
             if not device_exists:
-                print(f"📱 New device detected during login: {device_id[:8]}...")
+                print(f"📱 New device detected during login: {device_id[:8] if device_id else 'unknown'}...")
         
         token = jwt.encode({
             'email': email,
@@ -1235,11 +1316,9 @@ def login():
 @token_required
 def check_device(current_user):
     try:
-        # ✅ FIX 19: Get device_id from header (frontend sends it)
         device_id = request.headers.get('X-Device-ID') or request.args.get('device_id')
         
         if not device_id:
-            # Fallback to fingerprint for backward compatibility
             user_agent = request.headers.get('User-Agent', '')
             system_info = f"{platform.system()}{platform.release()}{platform.machine()}"
             fingerprint_string = system_info + user_agent
@@ -1338,10 +1417,8 @@ def add_device(current_user):
             'os': os
         }
         
-        # Check if user now has 2+ devices and should start ML training
         updated_user = users_collection.find_one({'email': current_user['email']})
         if len(updated_user.get('devices', [])) >= 2:
-            # Start ML training
             start_ml_training(current_user['email'])
         
         return jsonify({
@@ -1386,7 +1463,6 @@ def get_user_devices(current_user):
         
         devices = list(devices_cursor)
         
-        # ✅ FIX 20: Add online status from device_locations
         for device in devices:
             device_location = device_locations_collection.find_one(
                 {'device_id': device['device_id']}
@@ -1491,7 +1567,6 @@ def get_all_devices_locations(current_user):
     try:
         print(f"📌 Loading locations for user: {current_user['email']}")
         
-        # ✅ FIX 21: Get locations from device_locations collection (real-time)
         user_devices_cursor = device_locations_collection.find(
             {'user_email': current_user['email']},
             {'_id': 0}
@@ -1501,7 +1576,6 @@ def get_all_devices_locations(current_user):
         current_time = datetime.datetime.utcnow()
         
         for location in user_devices_cursor:
-            # Check if device is still considered online (updated in last 2 minutes)
             location_time = location.get('timestamp', current_time)
             if isinstance(location_time, str):
                 try:
@@ -1510,7 +1584,7 @@ def get_all_devices_locations(current_user):
                     location_time = current_time
             
             time_diff = (current_time - location_time).total_seconds()
-            is_online = time_diff < 120  # 2 minutes
+            is_online = time_diff < 120
             
             loc_data = {
                 'device_id': location['device_id'],
@@ -1545,7 +1619,6 @@ def get_ml_status(current_user):
         training_status = behavior_analyzer.get_training_status(current_user['email'])
         
         if not training_status:
-            # Check if user has 2+ devices
             user = users_collection.find_one({'email': current_user['email']})
             device_count = len(user.get('devices', [])) if user else 0
             
@@ -1564,7 +1637,6 @@ def get_ml_status(current_user):
             
             return jsonify(status), 200
         
-        # Get additional info from model if trained
         model_info = {}
         if training_status.get('is_trained') and current_user['email'] in user_models:
             with model_lock:
@@ -1608,7 +1680,6 @@ def start_ml_training_route(current_user):
                 'message': f'Need 2+ devices to start ML training. Currently have {device_count}.'
             }), 400
         
-        # Check if already training or trained
         training_status = behavior_analyzer.get_training_status(current_user['email'])
         if training_status and (training_status.get('is_training') or training_status.get('is_trained')):
             return jsonify({
@@ -1616,7 +1687,6 @@ def start_ml_training_route(current_user):
                 'message': 'ML training already in progress or completed'
             }), 400
         
-        # Start training
         success = start_ml_training(current_user['email'])
         
         if success:
@@ -1646,10 +1716,8 @@ def get_device_patterns(current_user):
         for device_id in user.get('devices', []):
             pattern = behavior_analyzer.get_device_pattern(current_user['email'], device_id)
             if pattern:
-                # Clean up the pattern data
                 pattern.pop('_id', None)
                 
-                # Calculate some statistics
                 if 'section_visits' in pattern:
                     total_visits = sum(pattern['section_visits'].values())
                     pattern['section_percentages'] = {
@@ -1677,7 +1745,6 @@ def system_status(current_user):
         behavior_count = behavior_analyzer.behavior_collection.count_documents({})
         connected_devices_count = device_connections_collection.count_documents({'is_online': True})
         
-        # Count trained models
         models_dir = 'models'
         trained_models = 0
         if os.path.exists(models_dir):
@@ -1694,30 +1761,27 @@ def system_status(current_user):
             'connected_devices': connected_devices_count,
             'cache_size': len(last_location_cache),
             'timestamp': datetime.datetime.utcnow().isoformat(),
-            'multi_device_active': True
+            'multi_device_active': True,
+            'device_id_fix': 'APPLIED'
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# New endpoint for live debugging
 @app.route('/api/debug/locations', methods=['GET'])
 @token_required
 def debug_locations(current_user):
     try:
-        # Get all locations for debugging
         all_locations = list(locations_collection.find(
             {'user_email': current_user['email']},
             {'_id': 0}
         ).sort('timestamp', -1).limit(50))
         
-        # Get device info
         device_ids = list(set([loc['device_id'] for loc in all_locations]))
         devices = {d['device_id']: d for d in devices_collection.find(
             {'device_id': {'$in': device_ids}},
             {'device_name': 1, 'os': 1, '_id': 0}
         )}
         
-        # Format response
         formatted = []
         for loc in all_locations:
             formatted.append({
@@ -1739,7 +1803,6 @@ def debug_locations(current_user):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ✅ FIX 22: New endpoint to get connected devices
 @app.route('/api/connected-devices', methods=['GET'])
 @token_required
 def get_connected_devices(current_user):
@@ -1749,7 +1812,6 @@ def get_connected_devices(current_user):
             {'_id': 0, 'device_id': 1, 'connected_at': 1, 'socket_id': 1}
         ))
         
-        # Add device info
         for device in connected_devices_list:
             device_info = devices_collection.find_one(
                 {'device_id': device['device_id']},
@@ -1768,32 +1830,21 @@ def get_connected_devices(current_user):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     
-    # Create models directory if it doesn't exist
     os.makedirs("models", exist_ok=True)
     
     print(f"🚀 Starting server on port {port}")
     print(f"📍 Location validation settings:")
-    print(f"   - High accuracy threshold: < {HIGH_ACCURACY_THRESHOLD}m (anchor points)")
+    print(f"   - High accuracy threshold: < {HIGH_ACCURACY_THRESHOLD}m")
     print(f"   - Maximum acceptable accuracy: < {MAX_ACCEPTABLE_ACCURACY}m")
-    print(f"   - Maximum position drift: {MAX_POSITION_DRIFT}m (for medium accuracy locations)")
+    print(f"   - Maximum position drift: {MAX_POSITION_DRIFT}m")
     print(f"🏛️ University system enabled - 12x12 meter sections")
     print(f"🤖 ENHANCED ML Anomaly Detection: Active")
-    print(f"   - Training: 5 minutes or 30 samples")
-    print(f"   - Features: Distance, sections, speed, time, patterns")
-    print(f"   - Detection: Pair anomalies + individual device anomalies")
-    print(f"   - Persistence: Models saved to disk")
-    print(f"📂 Models directory: {os.path.abspath('models')}")
     print(f"🌐 WebSocket enabled with threading mode")
-    print(f"🛡️ BACKEND PROTECTION ENABLED:")
-    print(f"   - Duplicate location cache: {CACHE_TTL}s TTL")
-    print(f"   - Minimal movement threshold: 3m for ML analysis")
-    print(f"   - Memory leak protection: Auto-clean cache")
-    print(f"🔧 MULTI-DEVICE SYSTEM ENABLED:")
-    print(f"   - Device ID from frontend (UUID)")
-    print(f"   - Device connections tracking")
-    print(f"   - Real-time device_locations collection")
-    print(f"   - Device online/offline status")
-    print(f"   - Broadcast to all devices per user")
+    print(f"🛡️ DEVICE_ID FIX APPLIED:")
+    print(f"   - WebSocket auth includes device_id")
+    print(f"   - Multiple fallback sources for device_id")
+    print(f"   - Hard validation prevents null device_id")
+    print(f"   - Worker crash protection enabled")
+    print(f"🔧 MULTI-DEVICE SYSTEM READY")
     
-    # Use threading mode for Render.com
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
