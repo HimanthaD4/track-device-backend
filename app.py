@@ -1,4 +1,4 @@
-# app.py - Updated WebSocket and Server Configuration with Backend Protection
+# app.py - Updated for Multi-Device Support
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_bcrypt import Bcrypt
@@ -14,7 +14,7 @@ import hashlib
 import math
 import threading
 import time
-
+import uuid
 
 from behavior_analyzer import BehaviorAnalyzer
 from ml_model import DeviceBehaviorModel
@@ -64,6 +64,10 @@ devices_collection = db.devices
 locations_collection = db.locations
 university_collection = db.university
 
+# ✅ FIX 1: Add collections for multi-device tracking
+device_connections_collection = db.device_connections
+device_locations_collection = db.device_locations_live
+
 # Create indexes with error handling
 try:
     devices_collection.create_index([('device_id', 1)], unique=True, background=True)
@@ -74,6 +78,14 @@ try:
     locations_collection.create_index([('user_email', 1)], background=True)
     locations_collection.create_index([('device_id', 1), ('timestamp', -1)], background=True)
     university_collection.create_index([('user_email', 1)], unique=True, background=True)
+    
+    # ✅ FIX 2: Indexes for multi-device
+    device_connections_collection.create_index([('device_id', 1)], unique=True, background=True)
+    device_connections_collection.create_index([('user_email', 1)], background=True)
+    device_connections_collection.create_index([('socket_id', 1)], background=True)
+    device_locations_collection.create_index([('device_id', 1)], unique=True, background=True)
+    device_locations_collection.create_index([('user_email', 1)], background=True)
+    device_locations_collection.create_index([('timestamp', -1)], background=True)
 except Exception as e:
     print(f"Index creation warning: {e}")
 
@@ -84,6 +96,11 @@ behavior_analyzer = BehaviorAnalyzer(db)
 user_models = {}
 training_threads = {}
 model_lock = threading.Lock()
+
+# ✅ FIX 3: Multi-device tracking structures
+connected_devices = {}  # device_id -> socket_id
+user_devices = {}       # user_email -> set(device_id)
+device_locations = {}   # device_id -> location_data
 
 # SMART LOCATION VALIDATION SETTINGS - RELAXED FOR DEMO
 HIGH_ACCURACY_THRESHOLD = 10.0  # Increased from 3.0 for better anchor points
@@ -101,7 +118,7 @@ SECTION_CONFIGS = [
     {'name': 'Admin Block', 'color': '#1abc9c', 'row': 2, 'col': 1}
 ]
 
-# ✅ BACKEND FIX 1: Cache to prevent duplicate location processing
+# ✅ FIX 4: Cache to prevent duplicate location processing
 last_location_cache = {}
 CACHE_TTL = 2  # Cache entries valid for 2 seconds
 
@@ -189,12 +206,8 @@ def detect_browser(user_agent):
     else:
         return 'Unknown'
 
-def generate_device_fingerprint():
-    system_info = f"{platform.system()}{platform.release()}{platform.machine()}"
-    user_agent = request.headers.get('User-Agent', '')
-    fingerprint_string = system_info + user_agent
-    device_id = hashlib.sha256(fingerprint_string.encode()).hexdigest()
-    return device_id
+# ✅ FIX 5: REMOVE generate_device_fingerprint - Use device_id from frontend
+# Frontend now generates UUID and sends it
 
 def calculate_distance(lat1, lon1, lat2, lon2):
     R = 6371000
@@ -429,7 +442,7 @@ def analyze_device_behavior(user_email, device_locations):
     sections = university_data['sections']
     device_list = list(device_locations.values())
     
-    # ✅ BACKEND FIX 2: Check if devices have moved meaningfully before analysis
+    # ✅ FIX 6: Check if devices have moved meaningfully before analysis
     meaningful_movement = False
     for device in device_list:
         last_loc = locations_collection.find_one(
@@ -607,6 +620,44 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     print(f'⚠️ Client disconnected: {request.sid}')
+    
+    # ✅ FIX 7: Clean up device connection on disconnect
+    try:
+        # Find device associated with this socket
+        connection = device_connections_collection.find_one({'socket_id': request.sid})
+        if connection:
+            device_id = connection['device_id']
+            user_email = connection['user_email']
+            
+            # Remove from active connections
+            device_connections_collection.delete_one({'socket_id': request.sid})
+            print(f"🗑️ Removed connection for device {device_id[:8]}...")
+            
+            # Update device_locations to mark as offline
+            device_locations_collection.update_one(
+                {'device_id': device_id},
+                {'$set': {'is_online': False, 'last_seen': datetime.datetime.utcnow()}},
+                upsert=True
+            )
+            
+            # Update in-memory tracking
+            if device_id in connected_devices:
+                del connected_devices[device_id]
+            
+            if user_email in user_devices and device_id in user_devices[user_email]:
+                user_devices[user_email].remove(device_id)
+            
+            # Notify other devices that this device went offline
+            try:
+                socketio.emit('device_offline', {
+                    'device_id': device_id,
+                    'timestamp': datetime.datetime.utcnow().isoformat()
+                }, room=user_email)
+            except Exception as e:
+                print(f"⚠️ Could not emit device offline: {e}")
+                
+    except Exception as e:
+        print(f"⚠️ Error cleaning up device connection: {e}")
 
 @socketio.on_error()
 def handle_error(e):
@@ -616,11 +667,17 @@ def handle_error(e):
 def handle_join_room(data):
     try:
         user_email = data.get('user_email')
+        device_id = data.get('device_id')  # ✅ FIX 8: Get device_id from data
         token = data.get('token')
         
         if not user_email:
             print("❌ No user_email provided for join_room")
             emit('join_error', {'message': 'User email required'})
+            return
+        
+        if not device_id:
+            print("❌ No device_id provided for join_room")
+            emit('join_error', {'message': 'Device ID required'})
             return
         
         # Verify token if provided
@@ -636,9 +693,96 @@ def handle_join_room(data):
                 print(f"⚠️ Token verification failed: {e}")
                 # Still allow join for demo purposes
         
+        # ✅ FIX 9: Track device connection
+        device_connections_collection.update_one(
+            {'device_id': device_id},
+            {
+                '$set': {
+                    'socket_id': request.sid,
+                    'user_email': user_email,
+                    'connected_at': datetime.datetime.utcnow(),
+                    'is_online': True
+                }
+            },
+            upsert=True
+        )
+        
+        # Update in-memory tracking
+        connected_devices[device_id] = request.sid
+        
+        if user_email not in user_devices:
+            user_devices[user_email] = set()
+        user_devices[user_email].add(device_id)
+        
         join_room(user_email)
-        print(f'✅ User {user_email} joined room')
-        emit('join_confirmation', {'message': f'Joined room for {user_email}', 'user_email': user_email})
+        print(f'✅ Device {device_id[:8]}... for user {user_email} joined room')
+        emit('join_confirmation', {
+            'message': f'Joined room for {user_email}',
+            'user_email': user_email,
+            'device_id': device_id
+        })
+        
+        # ✅ FIX 10: Update device_locations with connection info
+        device_info = devices_collection.find_one({'device_id': device_id})
+        device_name = device_info.get('device_name', 'Unknown Device') if device_info else 'Unknown Device'
+        device_os = device_info.get('os', 'Unknown') if device_info else 'Unknown'
+        
+        device_locations_collection.update_one(
+            {'device_id': device_id},
+            {
+                '$set': {
+                    'device_id': device_id,
+                    'device_name': device_name,
+                    'os': device_os,
+                    'user_email': user_email,
+                    'is_online': True,
+                    'socket_id': request.sid,
+                    'last_seen': datetime.datetime.utcnow(),
+                    'connected_at': datetime.datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
+        
+        # Send all device locations for this user
+        try:
+            # Get all devices for this user
+            user = users_collection.find_one({'email': user_email})
+            if user and 'devices' in user:
+                for dev_id in user['devices']:
+                    # Get latest location
+                    location = locations_collection.find_one(
+                        {'device_id': dev_id},
+                        sort=[('timestamp', -1)]
+                    )
+                    
+                    if location:
+                        # Get device info
+                        device = devices_collection.find_one({'device_id': dev_id})
+                        device_name = device.get('device_name', 'Unknown') if device else 'Unknown'
+                        device_os = device.get('os', 'Unknown') if device else 'Unknown'
+                        
+                        # Check if device is online
+                        is_online = dev_id in connected_devices
+                        
+                        broadcast_data = {
+                            'device_id': dev_id,
+                            'device_name': device_name,
+                            'os': device_os,
+                            'latitude': location['latitude'],
+                            'longitude': location['longitude'],
+                            'accuracy': location.get('accuracy', 0),
+                            'timestamp': location['timestamp'].isoformat(),
+                            'validation_reason': location.get('validation_reason', 'unknown'),
+                            'current_section': location.get('current_section', 'Outside Campus'),
+                            'is_online': is_online
+                        }
+                        
+                        # Send to all devices in user room
+                        socketio.emit('location_update', broadcast_data, room=user_email)
+            
+        except Exception as e:
+            print(f"⚠️ Error sending initial locations: {e}")
         
         # Send ML status
         training_status = behavior_analyzer.get_training_status(user_email)
@@ -666,6 +810,18 @@ def handle_join_room(data):
                     })
                 except Exception as e:
                     print(f"⚠️ Could not emit ML ready status: {e}")
+                    
+        # Notify other devices that new device joined
+        try:
+            socketio.emit('device_connected', {
+                'device_id': device_id,
+                'device_name': device_name,
+                'os': device_os,
+                'timestamp': datetime.datetime.utcnow().isoformat()
+            }, room=user_email)
+        except Exception as e:
+            print(f"⚠️ Could not emit device connected: {e}")
+            
     except Exception as e:
         print(f"❌ Error joining room: {str(e)}")
         emit('join_error', {'message': str(e)})
@@ -673,16 +829,16 @@ def handle_join_room(data):
 @socketio.on('update_location')
 def handle_location_update(data):
     try:
-        print(f"📍 Received location update: {data.get('device_id', 'unknown')}")
-        
         device_id = data.get('device_id')
+        print(f"📍 Received location update for device: {device_id[:8] if device_id else 'unknown'}")
+        
         latitude = data.get('latitude')
         longitude = data.get('longitude')
         accuracy = data.get('accuracy', 0)
         user_email = data.get('user_email')
         
         if not all([device_id, latitude, longitude, user_email]):
-            print(f"❌ Missing required fields: {data}")
+            print(f"❌ Missing required fields: device_id={device_id}, user_email={user_email}")
             return
         
         try:
@@ -693,7 +849,7 @@ def handle_location_update(data):
             print(f"❌ Invalid coordinate format: {e}")
             return
         
-        # ✅ BACKEND FIX 3: Check cache for duplicate locations to prevent spam
+        # ✅ FIX 11: Check cache for duplicate locations to prevent spam
         cache_key = f"{device_id}_{user_email}"
         current_time = datetime.datetime.utcnow()
         
@@ -723,22 +879,10 @@ def handle_location_update(data):
         for key in cache_keys_to_delete:
             del last_location_cache[key]
         
-        # Store raw location immediately for faster response
-        raw_location_data = {
-            'device_id': device_id,
-            'latitude': raw_lat,
-            'longitude': raw_lng,
-            'accuracy': acc,
-            'timestamp': current_time,
-            'user_email': user_email,
-            'validation_reason': 'raw_location'
-        }
-        
-        locations_collection.update_one(
-            {'device_id': device_id, 'validation_reason': 'raw_location'},
-            {'$set': raw_location_data},
-            upsert=True
-        )
+        # ✅ FIX 12: Update device_locations collection with real-time status
+        device_info = devices_collection.find_one({'device_id': device_id})
+        device_name = device_info.get('device_name', 'Unknown Device') if device_info else 'Unknown Device'
+        device_os = device_info.get('os', 'Unknown') if device_info else 'Unknown'
         
         # Validate and constrain
         validated_lat, validated_lng, validated_acc, is_valid, reason = validate_and_constrain_location(
@@ -763,6 +907,23 @@ def handle_location_update(data):
         if university_data and 'sections' in university_data:
             current_section = detect_section(validated_lat, validated_lng, university_data['sections'])
             print(f"📌 Device {device_id[:8]} in section: {current_section}")
+        
+        # Store raw location immediately for faster response
+        raw_location_data = {
+            'device_id': device_id,
+            'latitude': raw_lat,
+            'longitude': raw_lng,
+            'accuracy': acc,
+            'timestamp': current_time,
+            'user_email': user_email,
+            'validation_reason': 'raw_location'
+        }
+        
+        locations_collection.update_one(
+            {'device_id': device_id, 'validation_reason': 'raw_location'},
+            {'$set': raw_location_data},
+            upsert=True
+        )
         
         location_data = {
             'device_id': device_id,
@@ -812,14 +973,51 @@ def handle_location_update(data):
             }}
         )
         
+        # ✅ FIX 13: Update device_locations for real-time tracking
+        device_locations_collection.update_one(
+            {'device_id': device_id},
+            {
+                '$set': {
+                    'device_id': device_id,
+                    'device_name': device_name,
+                    'os': device_os,
+                    'latitude': validated_lat,
+                    'longitude': validated_lng,
+                    'accuracy': validated_acc,
+                    'user_email': user_email,
+                    'current_section': current_section,
+                    'timestamp': current_time,
+                    'is_online': True,
+                    'last_seen': current_time
+                }
+            },
+            upsert=True
+        )
+        
+        # Update in-memory location storage
+        device_locations[device_id] = {
+            'device_id': device_id,
+            'device_name': device_name,
+            'os': device_os,
+            'latitude': validated_lat,
+            'longitude': validated_lng,
+            'accuracy': validated_acc,
+            'timestamp': current_time,
+            'current_section': current_section,
+            'is_online': True
+        }
+        
         broadcast_data = {
             'device_id': device_id,
+            'device_name': device_name,
+            'os': device_os,
             'latitude': validated_lat,
             'longitude': validated_lng,
             'accuracy': validated_acc,
             'timestamp': location_data['timestamp'].isoformat(),
             'validation_reason': reason,
-            'current_section': current_section
+            'current_section': current_section,
+            'is_online': True
         }
         
         try:
@@ -828,7 +1026,7 @@ def handle_location_update(data):
         except Exception as e:
             print(f"⚠️ Could not emit location update: {e}")
         
-        # ✅ BACKEND FIX 4: Skip ML analysis for minimal movement
+        # ✅ FIX 14: Skip ML analysis for minimal movement
         user = users_collection.find_one({'email': user_email})
         if user and len(user.get('devices', [])) >= 2:
             # Check if this is meaningful movement
@@ -853,17 +1051,17 @@ def handle_location_update(data):
                     print(f"⏭️ Skipping ML analysis (minimal movement: {distance_moved:.1f}m)")
             
             if should_analyze:
-                user_devices = {}
+                user_devices_locations = {}
                 for dev_id in user.get('devices', []):
                     loc = locations_collection.find_one(
                         {'device_id': dev_id, 'validation_reason': {'$ne': 'raw_location'}},
                         sort=[('timestamp', -1)]
                     )
                     if loc and 'latitude' in loc:
-                        user_devices[dev_id] = loc
+                        user_devices_locations[dev_id] = loc
                 
-                if len(user_devices) >= 2:
-                    analyze_device_behavior(user_email, user_devices)
+                if len(user_devices_locations) >= 2:
+                    analyze_device_behavior(user_email, user_devices_locations)
         
     except Exception as e:
         print(f"❌ Error updating location: {str(e)}")
@@ -885,8 +1083,8 @@ def health_check():
         if os.path.exists(models_dir):
             model_count = len([f for f in os.listdir(models_dir) if f.endswith('.pkl')])
         
-        # Check if server is running
-        server_status = "running"
+        # Check connected devices
+        connected_count = len(connected_devices)
         
         return jsonify({
             'status': 'healthy',
@@ -894,10 +1092,13 @@ def health_check():
             'database': 'connected',
             'ml_models': model_count,
             'active_users': len(user_models),
-            'server': server_status,
+            'connected_devices': connected_count,
+            'device_locations_count': len(device_locations),
+            'server': 'running',
             'version': '1.0.0',
             'websocket_support': True,
-            'cache_size': len(last_location_cache)
+            'cache_size': len(last_location_cache),
+            'multi_device_support': True
         }), 200
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
@@ -908,6 +1109,8 @@ def register():
         data = request.json
         email = data.get('email')
         password = data.get('password')
+        device_id = data.get('device_id')  # ✅ FIX 15: Get device_id from frontend
+        device_info = data.get('device_info', {})
         
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
@@ -936,10 +1139,40 @@ def register():
         
         user.pop('password', None)
         
+        # ✅ FIX 16: If device_id provided, register the device
+        if device_id:
+            try:
+                device_os = device_info.get('os', 'Unknown')
+                user_agent = device_info.get('userAgent', 'Unknown')
+                
+                device = {
+                    'device_id': device_id,
+                    'device_name': f"{device_os} Device",
+                    'user_email': email,
+                    'added_at': datetime.datetime.utcnow(),
+                    'os': device_os,
+                    'browser': detect_browser(user_agent),
+                    'user_agent': user_agent,
+                    'last_seen': datetime.datetime.utcnow(),
+                    'location_tracking': False,
+                    'current_section': 'Outside Campus'
+                }
+                
+                devices_collection.insert_one(device)
+                users_collection.update_one(
+                    {'email': email},
+                    {'$push': {'devices': device_id}}
+                )
+                
+                print(f"📱 Device registered during registration: {device_id[:8]}...")
+            except Exception as e:
+                print(f"⚠️ Device registration during signup failed: {e}")
+        
         return jsonify({
             'message': 'User registered successfully',
             'token': token,
-            'user': serialize_document(user)
+            'user': serialize_document(user),
+            'device_registered': device_id is not None
         }), 201
         
     except Exception as e:
@@ -951,6 +1184,8 @@ def login():
         data = request.json
         email = data.get('email')
         password = data.get('password')
+        device_id = data.get('device_id')  # ✅ FIX 17: Get device_id from frontend
+        device_info = data.get('device_info', {})
         
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
@@ -962,8 +1197,14 @@ def login():
         if not bcrypt.check_password_hash(user['password'], password):
             return jsonify({'error': 'Invalid credentials'}), 401
         
-        device_id = generate_device_fingerprint()
-        device_exists = devices_collection.find_one({'device_id': device_id})
+        # ✅ FIX 18: Check if device exists or needs registration
+        device_exists = False
+        if device_id:
+            device_exists = devices_collection.find_one({'device_id': device_id}) is not None
+            
+            # If device doesn't exist, we'll need to register it later
+            if not device_exists:
+                print(f"📱 New device detected during login: {device_id[:8]}...")
         
         token = jwt.encode({
             'email': email,
@@ -982,8 +1223,9 @@ def login():
             'message': 'Login successful',
             'token': token,
             'user': user_data,
-            'device_exists': device_exists is not None,
-            'device_id': device_id
+            'device_exists': device_exists,
+            'device_id': device_id,
+            'needs_device_registration': device_id and not device_exists
         }), 200
         
     except Exception as e:
@@ -993,7 +1235,17 @@ def login():
 @token_required
 def check_device(current_user):
     try:
-        device_id = generate_device_fingerprint()
+        # ✅ FIX 19: Get device_id from header (frontend sends it)
+        device_id = request.headers.get('X-Device-ID') or request.args.get('device_id')
+        
+        if not device_id:
+            # Fallback to fingerprint for backward compatibility
+            user_agent = request.headers.get('User-Agent', '')
+            system_info = f"{platform.system()}{platform.release()}{platform.machine()}"
+            fingerprint_string = system_info + user_agent
+            device_id = hashlib.sha256(fingerprint_string.encode()).hexdigest()
+            print(f"⚠️ Using fallback device ID: {device_id[:8]}...")
+        
         device = devices_collection.find_one({'device_id': device_id})
         
         user = users_collection.find_one({'email': current_user['email']})
@@ -1030,9 +1282,12 @@ def check_device(current_user):
 @token_required
 def add_device(current_user):
     try:
-        device_id = generate_device_fingerprint()
         data = request.json
+        device_id = data.get('device_id')
         device_name = data.get('device_name', 'My Device')
+        
+        if not device_id:
+            return jsonify({'error': 'Device ID is required'}), 400
         
         existing_device = devices_collection.find_one({'device_id': device_id})
         
@@ -1131,6 +1386,17 @@ def get_user_devices(current_user):
         
         devices = list(devices_cursor)
         
+        # ✅ FIX 20: Add online status from device_locations
+        for device in devices:
+            device_location = device_locations_collection.find_one(
+                {'device_id': device['device_id']}
+            )
+            if device_location:
+                device['is_online'] = device_location.get('is_online', False)
+                device['last_location_time'] = device_location.get('timestamp')
+            else:
+                device['is_online'] = False
+        
         return jsonify({'devices': devices}), 200
         
     except Exception as e:
@@ -1225,84 +1491,43 @@ def get_all_devices_locations(current_user):
     try:
         print(f"📌 Loading locations for user: {current_user['email']}")
         
-        # Get all devices for this user
-        user = users_collection.find_one(
-            {'email': current_user['email']},
-            {'devices': 1, '_id': 0}
-        )
+        # ✅ FIX 21: Get locations from device_locations collection (real-time)
+        user_devices_cursor = device_locations_collection.find(
+            {'user_email': current_user['email']},
+            {'_id': 0}
+        ).sort('timestamp', -1)
         
-        if not user:
-            return jsonify({'locations': []}), 200
-        
-        device_ids = user.get('devices', [])
-        
-        if not device_ids:
-            print("❌ No devices found for user")
-            return jsonify({'locations': []}), 200
-        
-        print(f"📌 Looking for locations of {len(device_ids)} devices")
-        
-        # Get MOST RECENT location for EACH device (not just raw locations)
         all_locations = []
         current_time = datetime.datetime.utcnow()
         
-        for device_id in device_ids:
-            # Try to get validated location first
-            location = locations_collection.find_one(
-                {'device_id': device_id, 'validation_reason': {'$ne': 'raw_location'}},
-                sort=[('timestamp', -1)]
-            )
+        for location in user_devices_cursor:
+            # Check if device is still considered online (updated in last 2 minutes)
+            location_time = location.get('timestamp', current_time)
+            if isinstance(location_time, str):
+                try:
+                    location_time = datetime.datetime.fromisoformat(location_time.replace('Z', '+00:00'))
+                except:
+                    location_time = current_time
             
-            # If no validated location, try raw location
-            if not location:
-                location = locations_collection.find_one(
-                    {'device_id': device_id},
-                    sort=[('timestamp', -1)]
-                )
+            time_diff = (current_time - location_time).total_seconds()
+            is_online = time_diff < 120  # 2 minutes
             
-            if location:
-                # Get device details
-                device = devices_collection.find_one(
-                    {'device_id': device_id},
-                    {'device_name': 1, 'os': 1, '_id': 0}
-                )
-                
-                # Calculate if device is online (updated in last 2 minutes)
-                location_time = location['timestamp']
-                if isinstance(location_time, str):
-                    try:
-                        location_time = datetime.datetime.fromisoformat(location_time.replace('Z', '+00:00'))
-                    except:
-                        location_time = datetime.datetime.utcnow()
-                
-                time_diff = (current_time - location_time).total_seconds()
-                is_online = time_diff < 120  # 2 minutes
-                
-                # Get current section
-                current_section = location.get('current_section', 'Outside Campus')
-                if current_section == 'Outside Campus' and location.get('validation_reason') == 'raw_location':
-                    # Try to determine section for raw locations
-                    university_data = university_collection.find_one({'user_email': current_user['email']})
-                    if university_data and 'sections' in university_data:
-                        current_section = detect_section(location['latitude'], location['longitude'], university_data['sections'])
-                
-                loc_data = {
-                    'device_id': device_id,
-                    'device_name': device.get('device_name', 'Unknown') if device else 'Unknown',
-                    'os': device.get('os', 'Unknown') if device else 'Unknown',
-                    'latitude': location['latitude'],
-                    'longitude': location['longitude'],
-                    'accuracy': location.get('accuracy', 0),
-                    'timestamp': location_time.isoformat(),
-                    'is_online': is_online,
-                    'current_section': current_section,
-                    'validation_reason': location.get('validation_reason', 'unknown')
-                }
-                
-                all_locations.append(loc_data)
-                print(f"✅ Found location for device {device_id[:8]}")
+            loc_data = {
+                'device_id': location['device_id'],
+                'device_name': location.get('device_name', 'Unknown'),
+                'os': location.get('os', 'Unknown'),
+                'latitude': location.get('latitude', 0),
+                'longitude': location.get('longitude', 0),
+                'accuracy': location.get('accuracy', 0),
+                'timestamp': location_time.isoformat(),
+                'is_online': is_online,
+                'current_section': location.get('current_section', 'Outside Campus'),
+                'validation_reason': 'live_tracking'
+            }
+            
+            all_locations.append(loc_data)
         
-        print(f"📌 Returning {len(all_locations)} locations")
+        print(f"📌 Returning {len(all_locations)} live locations")
         return jsonify({
             'locations': all_locations
         }), 200
@@ -1450,6 +1675,7 @@ def system_status(current_user):
         device_count = devices_collection.count_documents({})
         location_count = locations_collection.count_documents({})
         behavior_count = behavior_analyzer.behavior_collection.count_documents({})
+        connected_devices_count = device_connections_collection.count_documents({'is_online': True})
         
         # Count trained models
         models_dir = 'models'
@@ -1465,8 +1691,10 @@ def system_status(current_user):
             'behavior_records': behavior_count,
             'trained_ml_models': trained_models,
             'active_ml_models': len(user_models),
+            'connected_devices': connected_devices_count,
             'cache_size': len(last_location_cache),
-            'timestamp': datetime.datetime.utcnow().isoformat()
+            'timestamp': datetime.datetime.utcnow().isoformat(),
+            'multi_device_active': True
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1511,6 +1739,32 @@ def debug_locations(current_user):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ✅ FIX 22: New endpoint to get connected devices
+@app.route('/api/connected-devices', methods=['GET'])
+@token_required
+def get_connected_devices(current_user):
+    try:
+        connected_devices_list = list(device_connections_collection.find(
+            {'user_email': current_user['email'], 'is_online': True},
+            {'_id': 0, 'device_id': 1, 'connected_at': 1, 'socket_id': 1}
+        ))
+        
+        # Add device info
+        for device in connected_devices_list:
+            device_info = devices_collection.find_one(
+                {'device_id': device['device_id']},
+                {'device_name': 1, 'os': 1, '_id': 0}
+            )
+            if device_info:
+                device.update(device_info)
+        
+        return jsonify({
+            'connected_devices': connected_devices_list,
+            'count': len(connected_devices_list)
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     
@@ -1534,6 +1788,12 @@ if __name__ == '__main__':
     print(f"   - Duplicate location cache: {CACHE_TTL}s TTL")
     print(f"   - Minimal movement threshold: 3m for ML analysis")
     print(f"   - Memory leak protection: Auto-clean cache")
+    print(f"🔧 MULTI-DEVICE SYSTEM ENABLED:")
+    print(f"   - Device ID from frontend (UUID)")
+    print(f"   - Device connections tracking")
+    print(f"   - Real-time device_locations collection")
+    print(f"   - Device online/offline status")
+    print(f"   - Broadcast to all devices per user")
     
     # Use threading mode for Render.com
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
