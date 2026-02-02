@@ -1,8 +1,8 @@
 # app.py - COMPLETELY UPDATED WITH WEB SOCKET DEVICE ID FIX
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from flask_bcrypt import Bcrypt
-from flask_socketio import SocketIO, emit, join_room
+from flask_socketio import SocketIO, emit, join_room, disconnect
 import pymongo
 from bson.objectid import ObjectId
 import os
@@ -694,8 +694,22 @@ def handle_connect():
             print(f"⚠️ Client {request.sid} connected without device_id in handshake")
             print(f"ℹ️ This is OK - device_id will come from join_room event")
         
-        # Store device_id in socket.io session for later use
-        socketio.save_session(request.sid, {'device_id': device_id})
+        # ✅ FIX: Store connection info in database (not session)
+        if device_id and validate_device_id(device_id):
+            device_connections_collection.update_one(
+                {'device_id': device_id},
+                {
+                    '$set': {
+                        'socket_id': request.sid,
+                        'device_id': device_id,
+                        'connected_at': datetime.datetime.utcnow(),
+                        'is_online': True,
+                        'last_ping': datetime.datetime.utcnow()
+                    }
+                },
+                upsert=True
+            )
+            print(f"✅ Stored connection for device: {device_id[:20] if device_id else 'None'}")
         
         print(f"✅ Client connected: {request.sid}")
         
@@ -719,30 +733,32 @@ def handle_disconnect():
         connection = device_connections_collection.find_one({'socket_id': request.sid})
         if connection:
             device_id = connection['device_id']
-            user_email = connection['user_email']
+            user_email = connection.get('user_email')
             
             device_connections_collection.delete_one({'socket_id': request.sid})
             print(f"🗑️ Removed connection for device {device_id[:8] if device_id else 'unknown'}...")
             
-            device_locations_collection.update_one(
-                {'device_id': device_id},
-                {'$set': {'is_online': False, 'last_seen': datetime.datetime.utcnow()}},
-                upsert=True
-            )
+            if device_id:
+                device_locations_collection.update_one(
+                    {'device_id': device_id},
+                    {'$set': {'is_online': False, 'last_seen': datetime.datetime.utcnow()}},
+                    upsert=True
+                )
             
             if device_id in connected_devices:
                 del connected_devices[device_id]
             
-            if user_email in user_devices and device_id in user_devices[user_email]:
+            if user_email and user_email in user_devices and device_id in user_devices[user_email]:
                 user_devices[user_email].remove(device_id)
             
-            try:
-                socketio.emit('device_offline', {
-                    'device_id': device_id,
-                    'timestamp': datetime.datetime.utcnow().isoformat()
-                }, room=user_email)
-            except Exception as e:
-                print(f"⚠️ Could not emit device offline: {e}")
+            if user_email:
+                try:
+                    socketio.emit('device_offline', {
+                        'device_id': device_id,
+                        'timestamp': datetime.datetime.utcnow().isoformat()
+                    }, room=user_email)
+                except Exception as e:
+                    print(f"⚠️ Could not emit device offline: {e}")
                 
     except Exception as e:
         print(f"⚠️ Error cleaning up device connection: {e}")
@@ -763,14 +779,14 @@ def handle_join_room(data):
         device_id = data.get('device_id')
         token = data.get('token')
         
-        # ✅ CRITICAL FIX: Get device_id from session if not in data
+        # ✅ CRITICAL FIX: Get device_id from database connection if not in data
         if not device_id or device_id == 'null':
-            session_data = socketio.get_session(request.sid)
-            if session_data and 'device_id' in session_data:
-                device_id = session_data['device_id']
-                print(f"🔄 Using device_id from session: {device_id[:20] if device_id else 'null'}")
+            connection = device_connections_collection.find_one({'socket_id': request.sid})
+            if connection:
+                device_id = connection.get('device_id')
+                print(f"🔄 Using device_id from connection: {device_id[:20] if device_id else 'null'}")
         
-        # ✅ HARD VALIDATION: Still no device_id? Use frontend's device_id
+        # ✅ HARD VALIDATION: Still no device_id? Fail
         if not device_id or device_id == 'null':
             print(f"❌ No device_id provided in join_room for {request.sid}")
             emit('join_error', {
@@ -848,7 +864,7 @@ def handle_join_room(data):
                 print(f"⚠️ Auto-creation failed: {e}")
                 # Continue anyway - device might already exist
         
-        # ✅ Track connection
+        # ✅ Track connection with user_email
         device_connections_collection.update_one(
             {'device_id': device_id},
             {
@@ -857,7 +873,8 @@ def handle_join_room(data):
                     'user_email': user_email,
                     'device_id': device_id,
                     'connected_at': datetime.datetime.utcnow(),
-                    'is_online': True
+                    'is_online': True,
+                    'last_ping': datetime.datetime.utcnow()
                 }
             },
             upsert=True
@@ -1205,7 +1222,7 @@ def health_check():
             'websocket_support': True,
             'cache_size': len(last_location_cache),
             'multi_device_support': True,
-            'device_id_fix': 'APPLIED_V2'  # ✅ Updated version
+            'device_id_fix': 'APPLIED_V3'  # ✅ Updated version
         }), 200
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
@@ -1784,7 +1801,7 @@ def system_status(current_user):
             'cache_size': len(last_location_cache),
             'timestamp': datetime.datetime.utcnow().isoformat(),
             'multi_device_active': True,
-            'device_id_fix': 'APPLIED_V2'
+            'device_id_fix': 'APPLIED_V3'
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1948,6 +1965,23 @@ def simulate_location(current_user):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/force-connect', methods=['POST'])
+@token_required
+def force_connect(current_user):
+    """Force reconnection for testing"""
+    device_id = request.json.get('device_id')
+    if not device_id:
+        return jsonify({'error': 'Device ID required'}), 400
+    
+    # Clean up any existing connection
+    device_connections_collection.delete_one({'device_id': device_id})
+    
+    return jsonify({
+        'success': True,
+        'message': 'Connection cleaned up. Please reconnect from frontend.',
+        'device_id': device_id
+    })
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     
@@ -1961,12 +1995,15 @@ if __name__ == '__main__':
     print(f"🏛️ University system enabled - 12x12 meter sections")
     print(f"🤖 ENHANCED ML Anomaly Detection: Active")
     print(f"🌐 WebSocket enabled with threading mode")
-    print(f"🛡️ DEVICE_ID FIX V2 APPLIED:")
-    print(f"   - Enhanced device_id extraction from WebSocket handshake")
+    print(f"🛡️ DEVICE_ID FIX V3 APPLIED:")
+    print(f"   - REMOVED socketio.save_session() (doesn't exist)")
+    print(f"   - Using database for connection tracking")
+    print(f"   - Enhanced device_id extraction")
     print(f"   - Auto-device creation on join_room")
-    print(f"   - Session-based device tracking")
-    print(f"   - Multiple fallback sources")
     print(f"🔧 MULTI-DEVICE SYSTEM READY")
-    print(f"🔍 Debug endpoints available at /api/test-device-id and /api/simulate-location")
+    print(f"🔍 Debug endpoints available:")
+    print(f"   - /api/test-device-id")
+    print(f"   - /api/simulate-location")
+    print(f"   - /api/force-connect")
     
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
