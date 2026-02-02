@@ -1,4 +1,4 @@
-# app.py - Updated WebSocket and Server Configuration
+# app.py - Updated WebSocket and Server Configuration with Backend Protection
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_bcrypt import Bcrypt
@@ -100,6 +100,10 @@ SECTION_CONFIGS = [
     {'name': 'Sports Complex', 'color': '#9b59b6', 'row': 1, 'col': 2},
     {'name': 'Admin Block', 'color': '#1abc9c', 'row': 2, 'col': 1}
 ]
+
+# ✅ BACKEND FIX 1: Cache to prevent duplicate location processing
+last_location_cache = {}
+CACHE_TTL = 2  # Cache entries valid for 2 seconds
 
 def generate_university_layout(center_lat, center_lon):
     sections = []
@@ -425,6 +429,27 @@ def analyze_device_behavior(user_email, device_locations):
     sections = university_data['sections']
     device_list = list(device_locations.values())
     
+    # ✅ BACKEND FIX 2: Check if devices have moved meaningfully before analysis
+    meaningful_movement = False
+    for device in device_list:
+        last_loc = locations_collection.find_one(
+            {'device_id': device['device_id']},
+            sort=[('timestamp', -1), ('_id', -1)]
+        )
+        
+        if last_loc and 'latitude' in last_loc:
+            distance = calculate_distance(
+                last_loc['latitude'], last_loc['longitude'],
+                device['latitude'], device['longitude']
+            )
+            if distance > 3.0:  # More than 3 meters movement
+                meaningful_movement = True
+                break
+    
+    if not meaningful_movement:
+        print(f"⏭️ Skipping ML analysis (no meaningful movement)")
+        return None
+    
     for i in range(len(device_list)):
         for j in range(i + 1, len(device_list)):
             device1 = device_list[i]
@@ -668,13 +693,43 @@ def handle_location_update(data):
             print(f"❌ Invalid coordinate format: {e}")
             return
         
+        # ✅ BACKEND FIX 3: Check cache for duplicate locations to prevent spam
+        cache_key = f"{device_id}_{user_email}"
+        current_time = datetime.datetime.utcnow()
+        
+        if cache_key in last_location_cache:
+            last_data, last_time = last_location_cache[cache_key]
+            time_diff = (current_time - last_time).total_seconds()
+            
+            # Check if this is the same location within 2 seconds
+            if time_diff < CACHE_TTL:
+                last_lat, last_lon, last_acc = last_data
+                distance = calculate_distance(last_lat, last_lon, raw_lat, raw_lng)
+                
+                # If minimal movement (< 2m) and accuracy didn't improve, skip
+                if distance < 2.0 and acc >= last_acc:
+                    print(f"⏭️ Skipping duplicate location for {device_id[:8]}... (moved {distance:.1f}m)")
+                    return
+        
+        # Update cache
+        last_location_cache[cache_key] = ((raw_lat, raw_lng, acc), current_time)
+        
+        # Clean old cache entries (prevent memory leak)
+        cache_keys_to_delete = []
+        for key in last_location_cache.keys():
+            if (current_time - last_location_cache[key][1]).total_seconds() > 10:
+                cache_keys_to_delete.append(key)
+        
+        for key in cache_keys_to_delete:
+            del last_location_cache[key]
+        
         # Store raw location immediately for faster response
         raw_location_data = {
             'device_id': device_id,
             'latitude': raw_lat,
             'longitude': raw_lng,
             'accuracy': acc,
-            'timestamp': datetime.datetime.utcnow(),
+            'timestamp': current_time,
             'user_email': user_email,
             'validation_reason': 'raw_location'
         }
@@ -717,7 +772,7 @@ def handle_location_update(data):
             'raw_latitude': raw_lat,
             'raw_longitude': raw_lng,
             'raw_accuracy': acc,
-            'timestamp': datetime.datetime.utcnow(),
+            'timestamp': current_time,
             'user_email': user_email,
             'validation_reason': reason,
             'current_section': current_section
@@ -727,7 +782,7 @@ def handle_location_update(data):
             location_data['best_latitude'] = validated_lat
             location_data['best_longitude'] = validated_lng
             location_data['best_accuracy'] = validated_acc
-            location_data['best_timestamp'] = datetime.datetime.utcnow()
+            location_data['best_timestamp'] = current_time
         else:
             existing = locations_collection.find_one(
                 {'device_id': device_id},
@@ -737,7 +792,7 @@ def handle_location_update(data):
                 location_data['best_latitude'] = existing['best_latitude']
                 location_data['best_longitude'] = existing['best_longitude']
                 location_data['best_accuracy'] = existing['best_accuracy']
-                location_data['best_timestamp'] = existing.get('best_timestamp', datetime.datetime.utcnow())
+                location_data['best_timestamp'] = existing.get('best_timestamp', current_time)
         
         locations_collection.update_one(
             {'device_id': device_id, 'validation_reason': {'$ne': 'raw_location'}},
@@ -748,7 +803,7 @@ def handle_location_update(data):
         devices_collection.update_one(
             {'device_id': device_id},
             {'$set': {
-                'last_seen': datetime.datetime.utcnow(),
+                'last_seen': current_time,
                 'location_tracking': True,
                 'last_latitude': validated_lat,
                 'last_longitude': validated_lng,
@@ -773,20 +828,42 @@ def handle_location_update(data):
         except Exception as e:
             print(f"⚠️ Could not emit location update: {e}")
         
-        # Check if we should analyze behavior
+        # ✅ BACKEND FIX 4: Skip ML analysis for minimal movement
         user = users_collection.find_one({'email': user_email})
         if user and len(user.get('devices', [])) >= 2:
-            user_devices = {}
-            for dev_id in user.get('devices', []):
-                loc = locations_collection.find_one(
-                    {'device_id': dev_id, 'validation_reason': {'$ne': 'raw_location'}},
-                    sort=[('timestamp', -1)]
-                )
-                if loc and 'latitude' in loc:
-                    user_devices[dev_id] = loc
+            # Check if this is meaningful movement
+            last_meaningful_location = locations_collection.find_one(
+                {'device_id': device_id, 'validation_reason': {'$ne': 'raw_location'}},
+                sort=[('timestamp', -1)]
+            )
             
-            if len(user_devices) >= 2:
-                analyze_device_behavior(user_email, user_devices)
+            should_analyze = True
+            if last_meaningful_location:
+                # Calculate distance from last meaningful location
+                distance_moved = calculate_distance(
+                    last_meaningful_location.get('latitude', validated_lat),
+                    last_meaningful_location.get('longitude', validated_lng),
+                    validated_lat,
+                    validated_lng
+                )
+                
+                # Skip ML if movement is less than 3 meters
+                if distance_moved < 3.0:
+                    should_analyze = False
+                    print(f"⏭️ Skipping ML analysis (minimal movement: {distance_moved:.1f}m)")
+            
+            if should_analyze:
+                user_devices = {}
+                for dev_id in user.get('devices', []):
+                    loc = locations_collection.find_one(
+                        {'device_id': dev_id, 'validation_reason': {'$ne': 'raw_location'}},
+                        sort=[('timestamp', -1)]
+                    )
+                    if loc and 'latitude' in loc:
+                        user_devices[dev_id] = loc
+                
+                if len(user_devices) >= 2:
+                    analyze_device_behavior(user_email, user_devices)
         
     except Exception as e:
         print(f"❌ Error updating location: {str(e)}")
@@ -819,7 +896,8 @@ def health_check():
             'active_users': len(user_models),
             'server': server_status,
             'version': '1.0.0',
-            'websocket_support': True
+            'websocket_support': True,
+            'cache_size': len(last_location_cache)
         }), 200
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
@@ -1387,6 +1465,7 @@ def system_status(current_user):
             'behavior_records': behavior_count,
             'trained_ml_models': trained_models,
             'active_ml_models': len(user_models),
+            'cache_size': len(last_location_cache),
             'timestamp': datetime.datetime.utcnow().isoformat()
         }), 200
     except Exception as e:
@@ -1451,6 +1530,10 @@ if __name__ == '__main__':
     print(f"   - Persistence: Models saved to disk")
     print(f"📂 Models directory: {os.path.abspath('models')}")
     print(f"🌐 WebSocket enabled with threading mode")
+    print(f"🛡️ BACKEND PROTECTION ENABLED:")
+    print(f"   - Duplicate location cache: {CACHE_TTL}s TTL")
+    print(f"   - Minimal movement threshold: 3m for ML analysis")
+    print(f"   - Memory leak protection: Auto-clean cache")
     
     # Use threading mode for Render.com
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
