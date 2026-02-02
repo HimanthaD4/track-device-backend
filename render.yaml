@@ -1,0 +1,18 @@
+# render.yaml
+services:
+  - type: web
+    name: device-tracker-backend
+    env: python
+    buildCommand: ""
+    startCommand: "gunicorn --worker-class eventlet -w 1 --threads 2 --timeout 120 --bind 0.0.0.0:$PORT app:app"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+    healthCheckPath: /api/health
+    autoDeploy: true
