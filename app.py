@@ -1,4 +1,4 @@
-# app.py - COMPLETELY UPDATED WITH WEB SOCKET DEVICE ID FIX
+# app.py - COMPLETELY UPDATED WITH FIXED REGISTRATION & LOGIN FLOW
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from flask_bcrypt import Bcrypt
@@ -1227,14 +1227,16 @@ def health_check():
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
 
+# ================ UPDATED REGISTRATION - NO DEVICE REGISTRATION ================
+
 @app.route('/api/register', methods=['POST'])
 def register():
     try:
         data = request.json
         email = data.get('email')
         password = data.get('password')
-        device_id = data.get('device_id')
-        device_info = data.get('device_info', {})
+        
+        # ✅ NO device_id or device_info required
         
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
@@ -1244,11 +1246,12 @@ def register():
         
         hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
         
+        # ✅ Create user account ONLY - NO devices
         user = {
             'email': email,
             'password': hashed_password,
             'created_at': datetime.datetime.utcnow(),
-            'devices': [],
+            'devices': [],  # Empty devices list
             'location_permission': False,
             'last_login': datetime.datetime.utcnow()
         }
@@ -1263,43 +1266,18 @@ def register():
         
         user.pop('password', None)
         
-        if device_id:
-            try:
-                device_os = device_info.get('os', 'Unknown')
-                user_agent = device_info.get('userAgent', 'Unknown')
-                
-                device = {
-                    'device_id': device_id,
-                    'device_name': f"{device_os} Device",
-                    'user_email': email,
-                    'added_at': datetime.datetime.utcnow(),
-                    'os': device_os,
-                    'browser': detect_browser(user_agent),
-                    'user_agent': user_agent,
-                    'last_seen': datetime.datetime.utcnow(),
-                    'location_tracking': False,
-                    'current_section': 'Outside Campus'
-                }
-                
-                devices_collection.insert_one(device)
-                users_collection.update_one(
-                    {'email': email},
-                    {'$push': {'devices': device_id}}
-                )
-                
-                print(f"📱 Device registered during registration: {device_id[:20] if device_id else 'unknown'}")
-            except Exception as e:
-                print(f"⚠️ Device registration during signup failed: {e}")
+        print(f"✅ User account created: {email}")
         
         return jsonify({
             'message': 'User registered successfully',
             'token': token,
-            'user': serialize_document(user),
-            'device_registered': device_id is not None
+            'user': serialize_document(user)
         }), 201
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+# ================ UPDATED LOGIN - NO DEVICE REGISTRATION ================
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -1307,8 +1285,8 @@ def login():
         data = request.json
         email = data.get('email')
         password = data.get('password')
-        device_id = data.get('device_id')
-        device_info = data.get('device_info', {})
+        
+        # ✅ NO device_id or device_info required
         
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
@@ -1319,13 +1297,6 @@ def login():
         
         if not bcrypt.check_password_hash(user['password'], password):
             return jsonify({'error': 'Invalid credentials'}), 401
-        
-        device_exists = False
-        if device_id:
-            device_exists = devices_collection.find_one({'device_id': device_id}) is not None
-            
-            if not device_exists:
-                print(f"📱 New device detected during login: {device_id[:20] if device_id else 'unknown'}...")
         
         token = jwt.encode({
             'email': email,
@@ -1340,17 +1311,18 @@ def login():
         user_data = serialize_document(user)
         user_data.pop('password', None)
         
+        print(f"✅ User logged in: {email}")
+        
         return jsonify({
             'message': 'Login successful',
             'token': token,
-            'user': user_data,
-            'device_exists': device_exists,
-            'device_id': device_id,
-            'needs_device_registration': device_id and not device_exists
+            'user': user_data
         }), 200
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+# ================ UPDATED CHECK-DEVICE - PROPER DEVICE DETECTION ================
 
 @app.route('/api/check-device', methods=['GET'])
 @token_required
@@ -1359,14 +1331,17 @@ def check_device(current_user):
         device_id = request.headers.get('X-Device-ID') or request.args.get('device_id')
         
         if not device_id:
+            # Generate fallback device ID
             user_agent = request.headers.get('User-Agent', '')
             system_info = f"{platform.system()}{platform.release()}{platform.machine()}"
             fingerprint_string = system_info + user_agent
             device_id = hashlib.sha256(fingerprint_string.encode()).hexdigest()
             print(f"⚠️ Using fallback device ID: {device_id[:20]}...")
         
+        # Check if device exists anywhere in the system
         device = devices_collection.find_one({'device_id': device_id})
         
+        # Check if current user has this device
         user = users_collection.find_one({'email': current_user['email']})
         user_has_device = device_id in user.get('devices', []) if user else False
         
@@ -1384,6 +1359,8 @@ def check_device(current_user):
                 device_status = 'registered_to_other'
                 device_owner = device['user_email']
         
+        print(f"🔍 Device check: {device_id[:20]}... - Status: {device_status}")
+        
         return jsonify({
             'device_id': device_id,
             'device_exists': device is not None,
@@ -1397,6 +1374,8 @@ def check_device(current_user):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ================ ADD-DEVICE ENDPOINT - WITH PROPER VALIDATION ================
+
 @app.route('/api/add-device', methods=['POST'])
 @token_required
 def add_device(current_user):
@@ -1405,9 +1384,10 @@ def add_device(current_user):
         device_id = data.get('device_id')
         device_name = data.get('device_name', 'My Device')
         
-        if not device_id:
-            return jsonify({'error': 'Device ID is required'}), 400
+        if not device_id or not validate_device_id(device_id):
+            return jsonify({'error': 'Valid Device ID is required'}), 400
         
+        # Check if device already exists in system
         existing_device = devices_collection.find_one({'device_id': device_id})
         
         if existing_device:
@@ -1419,6 +1399,7 @@ def add_device(current_user):
                     'owner': existing_device['user_email']
                 }), 400
         
+        # Check if user already has this device in their list
         user = users_collection.find_one({'email': current_user['email']})
         if device_id in user.get('devices', []):
             return jsonify({'error': 'Device already in your account'}), 400
@@ -1427,6 +1408,7 @@ def add_device(current_user):
         os = detect_os(user_agent)
         browser = detect_browser(user_agent)
         
+        # Create device record
         device = {
             'device_id': device_id,
             'device_name': device_name,
@@ -1436,17 +1418,20 @@ def add_device(current_user):
             'browser': browser,
             'user_agent': user_agent,
             'last_seen': datetime.datetime.utcnow(),
-            'location_tracking': False,
+            'location_tracking': False,  # Will be enabled when permission granted
             'current_section': 'Outside Campus'
         }
         
         result = devices_collection.insert_one(device)
         device['_id'] = str(result.inserted_id)
         
+        # Add device to user's devices list
         users_collection.update_one(
             {'email': current_user['email']},
             {'$push': {'devices': device_id}}
         )
+        
+        print(f"✅ Device added: {device_id[:20]}... to {current_user['email']}")
         
         device_status = {
             'device_id': device_id,
@@ -1457,15 +1442,21 @@ def add_device(current_user):
             'os': os
         }
         
+        # Check if ML training should start
         updated_user = users_collection.find_one({'email': current_user['email']})
-        if len(updated_user.get('devices', [])) >= 2:
-            start_ml_training(current_user['email'])
+        device_count = len(updated_user.get('devices', []))
+        
+        ml_training_started = False
+        if device_count >= 2:
+            print(f"🤖 User has {device_count} devices - ML training can start")
+            ml_training_started = True
         
         return jsonify({
             'message': 'Device added successfully',
             'device': serialize_document(device),
             'device_status': device_status,
-            'ml_training_started': len(updated_user.get('devices', [])) >= 2
+            'ml_training_started': ml_training_started,
+            'device_count': device_count
         }), 201
         
     except Exception as e:
@@ -2001,6 +1992,18 @@ if __name__ == '__main__':
     print(f"   - Enhanced device_id extraction")
     print(f"   - Auto-device creation on join_room")
     print(f"🔧 MULTI-DEVICE SYSTEM READY")
+    print(f"✅ FIXED REGISTRATION & LOGIN FLOW:")
+    print(f"   - Registration: Creates user account ONLY (no device)")
+    print(f"   - Login: NO automatic device registration")
+    print(f"   - Device check: Detects if device needs to be added")
+    print(f"   - Add device: Proper validation and permission flow")
+    print(f"🔍 Device workflow:")
+    print(f"   1. User registers → Account created (no device)")
+    print(f"   2. User logs in → Dashboard loads")
+    print(f"   3. Dashboard checks device → Shows add device form if needed")
+    print(f"   4. User adds device → Device linked to account")
+    print(f"   5. Location permission requested → Tracking enabled")
+    print(f"   6. 2+ devices → ML learning starts automatically")
     print(f"🔍 Debug endpoints available:")
     print(f"   - /api/test-device-id")
     print(f"   - /api/simulate-location")
