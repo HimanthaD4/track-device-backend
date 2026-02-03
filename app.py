@@ -1,4 +1,4 @@
-# app.py - COMPLETELY UPDATED WITH FIXED REGISTRATION & LOGIN FLOW
+# app.py - COMPLETELY UPDATED WITH FIXED DEVICE REGISTRATION (NO AUTO-CREATION)
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from flask_bcrypt import Bcrypt
@@ -770,7 +770,7 @@ def handle_error(e):
 
 @socketio.on('join_room')
 def handle_join_room(data):
-    """Handle device joining user room - COMPLETELY REWRITTEN"""
+    """Handle device joining user room - FIXED: NO AUTO-DEVICE CREATION"""
     try:
         print(f"🎯 JOIN_ROOM event received from {request.sid}")
         print(f"📦 Data received: {data}")
@@ -822,47 +822,28 @@ def handle_join_room(data):
         
         print(f"🔑 Join attempt - User: {user_email}, Device: {device_id[:20]}")
         
-        # ✅ Check if device exists, auto-create if not
+        # ✅ CRITICAL FIX: CHECK IF DEVICE EXISTS - DO NOT AUTO-CREATE
         device_exists = devices_collection.find_one({'device_id': device_id})
         
         if not device_exists:
-            print(f"📱 Device {device_id[:20]} not found - auto-creating...")
-            
-            user_agent = request.headers.get('User-Agent', 'Unknown') if hasattr(request, 'headers') else 'Unknown'
-            os = detect_os(user_agent)
-            
-            device = {
-                'device_id': device_id,
-                'device_name': f"{os} Device",
-                'user_email': user_email,
-                'added_at': datetime.datetime.utcnow(),
-                'os': os,
-                'browser': detect_browser(user_agent),
-                'user_agent': user_agent,
-                'last_seen': datetime.datetime.utcnow(),
-                'location_tracking': True,  # Auto-enable
-                'current_section': 'Outside Campus'
-            }
-            
-            try:
-                devices_collection.insert_one(device)
-                print(f"✅ Auto-created device for {user_email}")
-                
-                # Add to user's devices list
-                users_collection.update_one(
-                    {'email': user_email},
-                    {'$addToSet': {'devices': device_id}}
-                )
-                
-                # Auto-grant location permission
-                users_collection.update_one(
-                    {'email': user_email},
-                    {'$set': {'location_permission': True}}
-                )
-                
-            except Exception as e:
-                print(f"⚠️ Auto-creation failed: {e}")
-                # Continue anyway - device might already exist
+            print(f"⚠️ Device {device_id[:20]} not registered yet - waiting for explicit add-device")
+            emit('join_error', {
+                'message': 'Device not registered. Please add device first.',
+                'code': 'DEVICE_NOT_REGISTERED',
+                'device_id': device_id
+            })
+            return  # ✅ STOP HERE - Don't create device
+        
+        # Verify device belongs to this user
+        if device_exists['user_email'] != user_email:
+            print(f"❌ Device {device_id[:20]} belongs to {device_exists['user_email']}, not {user_email}")
+            emit('join_error', {
+                'message': 'Device registered to another account',
+                'code': 'DEVICE_WRONG_USER'
+            })
+            return
+        
+        print(f"✅ Device {device_id[:20]} properly registered to {user_email}")
         
         # ✅ Track connection with user_email
         device_connections_collection.update_one(
@@ -920,8 +901,7 @@ def handle_join_room(data):
             'user_email': user_email,
             'device_id': device_id,
             'device_name': device_name,
-            'device_os': device_os,
-            'device_created': not device_exists
+            'device_os': device_os
         })
         
         # Load and send existing locations for this user
@@ -1222,7 +1202,8 @@ def health_check():
             'websocket_support': True,
             'cache_size': len(last_location_cache),
             'multi_device_support': True,
-            'device_id_fix': 'APPLIED_V3'  # ✅ Updated version
+            'device_id_fix': 'APPLIED_V3',
+            'no_auto_device_creation': True  # ✅ Added flag
         }), 200
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
@@ -1792,7 +1773,8 @@ def system_status(current_user):
             'cache_size': len(last_location_cache),
             'timestamp': datetime.datetime.utcnow().isoformat(),
             'multi_device_active': True,
-            'device_id_fix': 'APPLIED_V3'
+            'device_id_fix': 'APPLIED_V3',
+            'no_auto_device_creation': True  # ✅ Added flag
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1986,12 +1968,11 @@ if __name__ == '__main__':
     print(f"🏛️ University system enabled - 12x12 meter sections")
     print(f"🤖 ENHANCED ML Anomaly Detection: Active")
     print(f"🌐 WebSocket enabled with threading mode")
-    print(f"🛡️ DEVICE_ID FIX V3 APPLIED:")
-    print(f"   - REMOVED socketio.save_session() (doesn't exist)")
-    print(f"   - Using database for connection tracking")
-    print(f"   - Enhanced device_id extraction")
-    print(f"   - Auto-device creation on join_room")
-    print(f"🔧 MULTI-DEVICE SYSTEM READY")
+    print(f"🛡️ CRITICAL DEVICE REGISTRATION FIX APPLIED:")
+    print(f"   - REMOVED auto-device creation from join_room handler")
+    print(f"   - Devices ONLY created via /api/add-device endpoint")
+    print(f"   - join_room now validates device exists and belongs to user")
+    print(f"   - No more duplicate device entries")
     print(f"✅ FIXED REGISTRATION & LOGIN FLOW:")
     print(f"   - Registration: Creates user account ONLY (no device)")
     print(f"   - Login: NO automatic device registration")
@@ -2001,9 +1982,10 @@ if __name__ == '__main__':
     print(f"   1. User registers → Account created (no device)")
     print(f"   2. User logs in → Dashboard loads")
     print(f"   3. Dashboard checks device → Shows add device form if needed")
-    print(f"   4. User adds device → Device linked to account")
-    print(f"   5. Location permission requested → Tracking enabled")
-    print(f"   6. 2+ devices → ML learning starts automatically")
+    print(f"   4. User adds device via /api/add-device → Device created")
+    print(f"   5. WebSocket join_room → Validates device registration")
+    print(f"   6. Location permission requested → Tracking enabled")
+    print(f"   7. 2+ devices → ML learning starts automatically")
     print(f"🔍 Debug endpoints available:")
     print(f"   - /api/test-device-id")
     print(f"   - /api/simulate-location")
