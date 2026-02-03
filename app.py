@@ -1,7 +1,7 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from flask_bcrypt import Bcrypt
-from flask_socketio import SocketIO, emit, join_room
+from flask_socketio import SocketIO, emit, join_room, disconnect
 import pymongo
 from bson.objectid import ObjectId
 import os
@@ -13,9 +13,13 @@ import hashlib
 import math
 import threading
 import time
+import uuid
 import urllib.parse
 import traceback
 import re
+
+from behavior_analyzer import BehaviorAnalyzer
+from ml_model import DeviceBehaviorModel
 
 load_dotenv()
 
@@ -71,14 +75,23 @@ try:
     locations_collection.create_index([('device_id', 1)], background=True)
     locations_collection.create_index([('timestamp', -1)], background=True)
     locations_collection.create_index([('user_email', 1)], background=True)
+    locations_collection.create_index([('device_id', 1), ('timestamp', -1)], background=True)
+    university_collection.create_index([('user_email', 1)], unique=True, background=True)
     device_connections_collection.create_index([('device_id', 1)], unique=True, background=True)
     device_connections_collection.create_index([('user_email', 1)], background=True)
+    device_connections_collection.create_index([('socket_id', 1)], background=True)
     device_locations_collection.create_index([('device_id', 1)], unique=True, background=True)
     device_locations_collection.create_index([('user_email', 1)], background=True)
+    device_locations_collection.create_index([('timestamp', -1)], background=True)
 except Exception as e:
     print(f"Index creation warning: {e}")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "default_secret_key")
+
+behavior_analyzer = BehaviorAnalyzer(db)
+user_models = {}
+training_threads = {}
+model_lock = threading.Lock()
 
 connected_devices = {}
 user_devices = {}
@@ -101,6 +114,11 @@ SECTION_CONFIGS = [
 last_location_cache = {}
 CACHE_TTL = 2
 
+def generate_ua_fingerprint(user_agent):
+    if not user_agent:
+        return None
+    return hashlib.sha256(user_agent.encode('utf-8')).hexdigest()
+
 def normalize_user_agent(user_agent):
     if not user_agent:
         return ""
@@ -111,11 +129,6 @@ def normalize_user_agent(user_agent):
     normalized = re.sub(r'safari/\d+', 'safari', normalized)
     normalized = ' '.join(normalized.split())
     return normalized
-
-def generate_ua_fingerprint(user_agent):
-    if not user_agent:
-        return None
-    return hashlib.sha256(user_agent.encode('utf-8')).hexdigest()
 
 def find_existing_device_for_user(user_email, device_id, user_agent):
     if not user_email:
@@ -147,25 +160,27 @@ def migrate_device_history(old_device_id, new_device_id, user_email):
             {'device_id': old_device_id, 'user_email': user_email},
             {'$set': {'device_id': new_device_id}}
         )
-        
         device_locations_result = device_locations_collection.update_many(
             {'device_id': old_device_id, 'user_email': user_email},
             {'$set': {'device_id': new_device_id}}
         )
-        
         connections_result = device_connections_collection.update_many(
             {'device_id': old_device_id, 'user_email': user_email},
             {'$set': {'device_id': new_device_id}}
         )
-        
-        users_collection.update_one(
-            {'email': user_email},
-            {'$pull': {'devices': old_device_id}}
-        )
-        users_collection.update_one(
-            {'email': user_email},
-            {'$addToSet': {'devices': new_device_id}}
-        )
+        try:
+            behavior_result = behavior_analyzer.behavior_collection.update_many(
+                {'$or': [
+                    {'device1_id': old_device_id, 'user_email': user_email},
+                    {'device2_id': old_device_id, 'user_email': user_email}
+                ]},
+                {'$set': {
+                    'device1_id': {'$cond': [{'$eq': ['$device1_id', old_device_id]}, new_device_id, '$device1_id']},
+                    'device2_id': {'$cond': [{'$eq': ['$device2_id', old_device_id]}, new_device_id, '$device2_id']}
+                }}
+            )
+        except Exception as e:
+            print(f"Could not update behavior records: {e}")
         
         return True
     except Exception as e:
@@ -370,6 +385,281 @@ def validate_and_constrain_location(device_id, latitude, longitude, accuracy):
             return latitude, longitude, accuracy, True, "within_drift_limit"
     else:
         return latitude, longitude, accuracy, True, "first_location_accepted"
+
+def start_ml_training(user_email):
+    print(f"Starting ML training for {user_email}")
+    
+    with model_lock:
+        if user_email not in user_models:
+            user_models[user_email] = DeviceBehaviorModel(user_email)
+        
+        model = user_models[user_email]
+        model.training_start_time = datetime.datetime.utcnow()
+    
+    behavior_analyzer.update_training_status(user_email, {
+        'training_started': datetime.datetime.utcnow(),
+        'is_training': True,
+        'is_trained': False,
+        'training_samples': 0,
+        'last_update': datetime.datetime.utcnow()
+    })
+    
+    try:
+        socketio.emit('ml_status_update', {
+            'is_training': True,
+            'is_trained': False,
+            'training_samples': 0,
+            'message': 'ML training started. Collecting behavior data...'
+        }, room=user_email)
+    except Exception as e:
+        print(f"Could not emit ML status: {e}")
+    
+    return True
+
+def check_and_train_model(user_email):
+    with model_lock:
+        if user_email not in user_models:
+            user_models[user_email] = DeviceBehaviorModel(user_email)
+        
+        model = user_models[user_email]
+    
+    training_status = behavior_analyzer.get_training_status(user_email)
+    
+    if training_status and training_status.get('is_trained'):
+        model_path = f"models/{user_email}_model.pkl"
+        if model.load_model(model_path):
+            print(f"Loaded trained model for {user_email}")
+            return True
+        else:
+            behavior_analyzer.update_training_status(user_email, {
+                'is_training': True,
+                'is_trained': False,
+                'training_samples': 0
+            })
+    
+    user = users_collection.find_one({'email': user_email})
+    device_count = len(user.get('devices', [])) if user else 0
+    
+    if device_count < 2:
+        print(f"ML Training paused for {user_email}: Only {device_count} device(s)")
+        return False
+    
+    if not training_status:
+        start_ml_training(user_email)
+        return False
+    
+    if training_status.get('is_training'):
+        training_started = training_status.get('training_started')
+        current_time = datetime.datetime.utcnow()
+        elapsed_minutes = (current_time - training_started).total_seconds() / 60
+        
+        behavior_data = behavior_analyzer.get_training_data(user_email, limit=200)
+        sample_count = len(behavior_data)
+        
+        behavior_analyzer.update_training_status(user_email, {
+            'training_samples': sample_count,
+            'last_update': current_time
+        })
+        
+        try:
+            socketio.emit('ml_training_progress', {
+                'samples': sample_count,
+                'elapsed_minutes': elapsed_minutes,
+                'target_minutes': 5,
+                'message': f'Collecting behavior patterns: {sample_count}/30 samples'
+            }, room=user_email)
+        except Exception as e:
+            print(f"Could not emit training progress: {e}")
+        
+        if sample_count >= 30 or elapsed_minutes >= 5:
+            print(f"Training ML model for {user_email} with {sample_count} samples...")
+            
+            device_patterns = {}
+            for device_id in user.get('devices', []):
+                pattern = behavior_analyzer.get_device_pattern(user_email, device_id)
+                if pattern:
+                    device_patterns[device_id] = pattern
+            
+            success, message = model.train_model(behavior_data, device_patterns)
+            
+            if success:
+                model_path = f"models/{user_email}_model.pkl"
+                os.makedirs("models", exist_ok=True)
+                model.save_model(model_path)
+                
+                behavior_analyzer.update_training_status(user_email, {
+                    'is_training': False,
+                    'is_trained': True,
+                    'training_completed': datetime.datetime.utcnow(),
+                    'training_samples': sample_count,
+                    'model_path': model_path,
+                    'model_info': model.get_model_info()
+                })
+                
+                print(f"ML Model trained successfully for {user_email}")
+                
+                try:
+                    socketio.emit('ml_training_complete', {
+                        'message': 'Security system activated!',
+                        'samples': sample_count,
+                        'model_info': model.get_model_info()
+                    }, room=user_email)
+                except Exception as e:
+                    print(f"Could not emit training complete: {e}")
+                
+                return True
+            else:
+                print(f"ML Training failed for {user_email}: {message}")
+                return False
+        else:
+            remaining_samples = max(0, 30 - sample_count)
+            print(f"ML Training for {user_email}: {sample_count}/30 samples")
+            return False
+    
+    return False
+
+def analyze_device_behavior(user_email, device_locations):
+    if len(device_locations) < 2:
+        return None
+    
+    valid_device_locations = {}
+    for dev_id, location in device_locations.items():
+        if validate_device_id(dev_id):
+            valid_device_locations[dev_id] = location
+        else:
+            print(f"Skipping invalid device_id in ML analysis: {dev_id}")
+    
+    if len(valid_device_locations) < 2:
+        return None
+    
+    university_data = university_collection.find_one({'user_email': user_email})
+    if not university_data or 'sections' not in university_data:
+        return None
+    
+    sections = university_data['sections']
+    device_list = list(valid_device_locations.values())
+    
+    meaningful_movement = False
+    for device in device_list:
+        last_loc = locations_collection.find_one(
+            {'device_id': device['device_id']},
+            sort=[('timestamp', -1), ('_id', -1)]
+        )
+        
+        if last_loc and 'latitude' in last_loc:
+            distance = calculate_distance(
+                last_loc['latitude'], last_loc['longitude'],
+                device['latitude'], device['longitude']
+            )
+            if distance > 3.0:
+                meaningful_movement = True
+                break
+    
+    if not meaningful_movement:
+        print(f"Skipping ML analysis (no meaningful movement)")
+        return None
+    
+    for i in range(len(device_list)):
+        for j in range(i + 1, len(device_list)):
+            device1 = device_list[i]
+            device2 = device_list[j]
+            
+            if not validate_device_id(device1['device_id']) or not validate_device_id(device2['device_id']):
+                print(f"Skipping invalid device pair: {device1['device_id']}, {device2['device_id']}")
+                continue
+            
+            device1_section = detect_section(device1['latitude'], device1['longitude'], sections)
+            device2_section = detect_section(device2['latitude'], device2['longitude'], sections)
+            
+            device1['current_section'] = device1_section
+            device2['current_section'] = device2_section
+            
+            behavior_record = behavior_analyzer.analyze_device_pair(user_email, device1, device2)
+            
+            model_ready = check_and_train_model(user_email)
+            
+            if model_ready:
+                with model_lock:
+                    if user_email in user_models:
+                        model = user_models[user_email]
+                        
+                        is_anomaly, confidence, message, anomaly_details = model.predict_anomaly(behavior_record)
+                        
+                        if is_anomaly:
+                            print(f"ANOMALY DETECTED for {user_email}!")
+                            print(f"   Score: {anomaly_details['score']:.3f}")
+                            print(f"   Device 1: {device1_section}")
+                            print(f"   Device 2: {device2_section}")
+                            print(f"   Distance: {behavior_record['distance_between_devices']:.1f}m")
+                            print(f"   Confidence: {confidence:.2f}")
+                            
+                            device1_pattern = behavior_analyzer.get_device_pattern(user_email, device1['device_id'])
+                            device2_pattern = behavior_analyzer.get_device_pattern(user_email, device2['device_id'])
+                            
+                            device1_anomaly, device1_details = model.detect_individual_anomaly(
+                                {'section_id': behavior_analyzer.get_section_id(device1_section),
+                                 'speed': behavior_record.get('movement_speed_device1', 0)},
+                                {'section_id': behavior_analyzer.get_section_id(device2_section),
+                                 'distance_to_other': behavior_record['distance_between_devices'],
+                                 'with_other_device': device2['device_id']}
+                            )
+                            
+                            device2_anomaly, device2_details = model.detect_individual_anomaly(
+                                {'section_id': behavior_analyzer.get_section_id(device2_section),
+                                 'speed': behavior_record.get('movement_speed_device2', 0)},
+                                {'section_id': behavior_analyzer.get_section_id(device1_section),
+                                 'distance_to_other': behavior_record['distance_between_devices'],
+                                 'with_other_device': device1['device_id']}
+                            )
+                            
+                            alert_data = {
+                                'message': 'Unusual device behavior detected!',
+                                'device1': device1['device_id'],
+                                'device2': device2['device_id'],
+                                'device1_section': device1_section,
+                                'device2_section': device2_section,
+                                'distance': behavior_record['distance_between_devices'],
+                                'confidence': confidence,
+                                'score': anomaly_details['score'],
+                                'threshold': anomaly_details['threshold'],
+                                'cluster_distance': anomaly_details.get('cluster_distance', 0),
+                                'timestamp': datetime.datetime.utcnow().isoformat(),
+                                'details': {
+                                    'pair_anomaly': True,
+                                    'device1_anomaly': device1_anomaly,
+                                    'device2_anomaly': device2_anomaly,
+                                    'device1_reasons': device1_details.get('reasons', []) if device1_anomaly else [],
+                                    'device2_reasons': device2_details.get('reasons', []) if device2_anomaly else [],
+                                    'feature_analysis': anomaly_details.get('features', {})
+                                }
+                            }
+                            
+                            try:
+                                socketio.emit('anomaly_alert', alert_data, room=user_email)
+                            except Exception as e:
+                                print(f"Could not emit anomaly alert: {e}")
+                            
+                            if device1_anomaly and device1_details.get('reasons'):
+                                try:
+                                    socketio.emit('individual_anomaly', {
+                                        'device_id': device1['device_id'],
+                                        'reasons': device1_details['reasons'],
+                                        'confidence': device1_details.get('confidence', 0.7),
+                                        'timestamp': datetime.datetime.utcnow().isoformat()
+                                    }, room=user_email)
+                                except Exception as e:
+                                    print(f"Could not emit individual anomaly: {e}")
+                            
+                            if device2_anomaly and device2_details.get('reasons'):
+                                try:
+                                    socketio.emit('individual_anomaly', {
+                                        'device_id': device2['device_id'],
+                                        'reasons': device2_details['reasons'],
+                                        'confidence': device2_details.get('confidence', 0.7),
+                                        'timestamp': datetime.datetime.utcnow().isoformat()
+                                    }, room=user_email)
+                                except Exception as e:
+                                    print(f"Could not emit individual anomaly: {e}")
 
 def token_required(f):
     def decorated(*args, **kwargs):
@@ -771,6 +1061,29 @@ def handle_location_update(data):
         except Exception as e:
             print(f"Could not emit location update: {e}")
         
+        user = users_collection.find_one({'email': user_email})
+        if user and len(user.get('devices', [])) >= 2:
+            try:
+                user_devices_locations = {}
+                for dev_id in user.get('devices', []):
+                    if not validate_device_id(dev_id):
+                        continue
+                    
+                    loc = device_locations_collection.find_one({'device_id': dev_id})
+                    if loc:
+                        user_devices_locations[dev_id] = loc
+                
+                if len(user_devices_locations) >= 2:
+                    import threading
+                    thread = threading.Thread(
+                        target=analyze_device_behavior,
+                        args=(user_email, user_devices_locations)
+                    )
+                    thread.daemon = True
+                    thread.start()
+            except Exception as e:
+                print(f"ML analysis setup failed: {e}")
+        
     except Exception as e:
         print(f"Error in update_location: {str(e)}")
 
@@ -782,17 +1095,30 @@ def home():
 def health_check():
     try:
         client.admin.command('ping')
+        
+        models_dir = 'models'
+        model_count = 0
+        if os.path.exists(models_dir):
+            model_count = len([f for f in os.listdir(models_dir) if f.endswith('.pkl')])
+        
         connected_count = len(connected_devices)
         
         return jsonify({
             'status': 'healthy',
             'timestamp': datetime.datetime.utcnow().isoformat(),
             'database': 'connected',
+            'ml_models': model_count,
+            'active_users': len(user_models),
             'connected_devices': connected_count,
+            'device_locations_count': len(device_locations),
             'server': 'running',
             'version': '1.0.0',
             'websocket_support': True,
-            'device_id_fix': 'APPLIED'
+            'cache_size': len(last_location_cache),
+            'multi_device_support': True,
+            'device_id_fix': 'APPLIED_V4',
+            'ua_fingerprinting': True,
+            'no_auto_device_creation': True
         }), 200
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
@@ -830,6 +1156,8 @@ def register():
         }, JWT_SECRET)
         
         user.pop('password', None)
+        
+        print(f"User account created: {email}")
         
         return jsonify({
             'message': 'User registered successfully',
@@ -870,6 +1198,8 @@ def login():
         user_data = serialize_document(user)
         user_data.pop('password', None)
         
+        print(f"User logged in: {email}")
+        
         return jsonify({
             'message': 'Login successful',
             'token': token,
@@ -890,6 +1220,11 @@ def check_device(current_user):
             system_info = f"{platform.system()}{platform.release()}{platform.machine()}"
             fingerprint_string = system_info + user_agent
             device_id = hashlib.sha256(fingerprint_string.encode()).hexdigest()
+            print(f"Using fallback device ID: {device_id[:20]}...")
+        
+        print(f"Device check for {current_user['email']}")
+        print(f"   Device ID: {device_id[:20]}...")
+        print(f"   User-Agent: {user_agent[:50]}...")
         
         existing_device, match_type = find_existing_device_for_user(
             current_user['email'], 
@@ -906,11 +1241,16 @@ def check_device(current_user):
             if match_type == 'exact_id':
                 device_status = 'registered_to_me'
                 device_owner = current_user['email']
+                print(f"Exact device ID match found")
+                
             elif match_type == 'ua_fingerprint':
                 device_status = 'needs_migration'
                 device_owner = current_user['email']
                 needs_migration = True
                 old_device_id = existing_device['device_id']
+                print(f"UA fingerprint match found - needs migration")
+                print(f"   Old device ID: {old_device_id[:20]}...")
+                print(f"   New device ID: {device_id[:20]}...")
         else:
             device = devices_collection.find_one({'device_id': device_id})
             if device:
@@ -931,6 +1271,10 @@ def check_device(current_user):
         
         os = detect_os(user_agent)
         
+        print(f"Device check result: {device_status}")
+        if needs_migration:
+            print(f"   Migration needed from: {old_device_id[:20]}...")
+        
         response = {
             'device_id': device_id,
             'device_exists': existing_device is not None,
@@ -950,6 +1294,8 @@ def check_device(current_user):
         return jsonify(response), 200
         
     except Exception as e:
+        print(f"Error in check_device: {str(e)}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/add-device', methods=['POST'])
@@ -967,6 +1313,11 @@ def add_device(current_user):
         normalized_ua = normalize_user_agent(user_agent)
         ua_fingerprint = generate_ua_fingerprint(normalized_ua)
         
+        print(f"Add device request for {current_user['email']}")
+        print(f"   Device ID: {device_id[:20]}...")
+        print(f"   UA Fingerprint: {ua_fingerprint[:20]}...")
+        print(f"   Normalized UA: {normalized_ua[:50]}...")
+        
         user = users_collection.find_one({'email': current_user['email']})
         user_has_device = False
         if user and 'devices' in user:
@@ -981,6 +1332,7 @@ def add_device(current_user):
         })
         
         if existing_device_exact:
+            print(f"Device {device_id[:20]}... already exists for user")
             return jsonify({
                 'message': 'Device already registered to your account',
                 'device': serialize_document(existing_device_exact),
@@ -994,9 +1346,43 @@ def add_device(current_user):
         })
         
         if device_other_user:
+            print(f"Device {device_id[:20]}... registered to {device_other_user['user_email']}")
+            
+            if user_agent:
+                other_ua_fingerprint = generate_ua_fingerprint(normalize_user_agent(device_other_user.get('user_agent', '')))
+                if ua_fingerprint == other_ua_fingerprint:
+                    print(f"Same UA fingerprint detected, migrating device...")
+                    
+                    migration_success = migrate_device_history(device_id, device_id, device_other_user['user_email'])
+                    
+                    if migration_success:
+                        devices_collection.update_one(
+                            {'device_id': device_id, 'user_email': device_other_user['user_email']},
+                            {'$set': {'user_email': current_user['email']}}
+                        )
+                        
+                        users_collection.update_one(
+                            {'email': device_other_user['user_email']},
+                            {'$pull': {'devices': device_id}}
+                        )
+                        users_collection.update_one(
+                            {'email': current_user['email']},
+                            {'$addToSet': {'devices': device_id}}
+                        )
+                        
+                        updated_device = devices_collection.find_one({'device_id': device_id})
+                        
+                        return jsonify({
+                            'message': 'Device migrated successfully from another account',
+                            'device': serialize_document(updated_device),
+                            'device_status': 'registered_to_me',
+                            'migrated': True
+                        }), 200
+            
             return jsonify({
                 'error': 'Device already registered to another account',
-                'owner': device_other_user['user_email']
+                'owner': device_other_user['user_email'],
+                'message': 'This device is registered to another user account.'
             }), 400
         
         existing_device_ua = devices_collection.find_one({
@@ -1009,6 +1395,8 @@ def add_device(current_user):
         
         if existing_device_ua:
             old_device_id = existing_device_ua['device_id']
+            print(f"UA fingerprint match found: {old_device_id[:20]}...")
+            print(f"   Migrating to new device ID: {device_id[:20]}...")
             
             update_result = devices_collection.update_one(
                 {'device_id': old_device_id, 'user_email': current_user['email']},
@@ -1020,6 +1408,8 @@ def add_device(current_user):
             )
             
             if update_result.modified_count > 0:
+                print(f"Updated device ID in devices collection")
+                
                 migration_success = migrate_device_history(old_device_id, device_id, current_user['email'])
                 
                 if migration_success:
@@ -1033,6 +1423,9 @@ def add_device(current_user):
                     )
                     
                     migration_performed = True
+                    print(f"Device migration completed successfully")
+                else:
+                    print(f"Migration failed, continuing with new device creation")
         
         if not migration_performed:
             os = detect_os(user_agent)
@@ -1059,6 +1452,8 @@ def add_device(current_user):
                 {'email': current_user['email']},
                 {'$addToSet': {'devices': device_id}}
             )
+            
+            print(f"New device created: {device_id[:20]}...")
         
         updated_device = devices_collection.find_one({
             'device_id': device_id,
@@ -1070,6 +1465,7 @@ def add_device(current_user):
         
         ml_training_started = False
         if device_count >= 2:
+            print(f"User has {device_count} devices - ML training can start")
             ml_training_started = True
         
         device_status = {
@@ -1097,6 +1493,8 @@ def add_device(current_user):
         return jsonify(response), 201
         
     except Exception as e:
+        print(f"Error in add_device: {str(e)}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/user-devices', methods=['GET'])
@@ -1187,6 +1585,7 @@ def grant_location_permission(current_user):
                 }
                 
                 university_collection.insert_one(university_data)
+                print(f"University created at {center_lat}, {center_lon}")
             except ValueError:
                 return jsonify({'error': 'Invalid coordinates'}), 400
         
@@ -1232,6 +1631,8 @@ def get_university_layout(current_user):
 @token_required
 def get_all_devices_locations(current_user):
     try:
+        print(f"Loading locations for user: {current_user['email']}")
+        
         user_devices_cursor = device_locations_collection.find(
             {'user_email': current_user['email']},
             {'_id': 0}
@@ -1266,8 +1667,134 @@ def get_all_devices_locations(current_user):
             
             all_locations.append(loc_data)
         
+        print(f"Returning {len(all_locations)} live locations")
         return jsonify({
             'locations': all_locations
+        }), 200
+        
+    except Exception as e:
+        print(f"Error loading locations: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/ml-status', methods=['GET'])
+@token_required
+def get_ml_status(current_user):
+    try:
+        training_status = behavior_analyzer.get_training_status(current_user['email'])
+        
+        if not training_status:
+            user = users_collection.find_one({'email': current_user['email']})
+            device_count = len(user.get('devices', [])) if user else 0
+            
+            status = {
+                'is_training': False,
+                'is_trained': False,
+                'training_samples': 0,
+                'device_count': device_count,
+                'can_start_training': device_count >= 2
+            }
+            
+            if device_count >= 2:
+                status['message'] = 'Ready to start ML training. Add location permission to begin.'
+            else:
+                status['message'] = f'Add {2 - device_count} more device(s) to start ML training'
+            
+            return jsonify(status), 200
+        
+        model_info = {}
+        if training_status.get('is_trained') and current_user['email'] in user_models:
+            with model_lock:
+                model = user_models[current_user['email']]
+                model_info = model.get_model_info()
+        
+        response = {
+            'is_training': training_status.get('is_training', False),
+            'is_trained': training_status.get('is_trained', False),
+            'training_samples': training_status.get('training_samples', 0),
+            'training_started': training_status.get('training_started', '').isoformat() if training_status.get('training_started') else None,
+            'training_completed': training_status.get('training_completed', '').isoformat() if training_status.get('training_completed') else None,
+            'model_info': model_info,
+            'message': training_status.get('message', '')
+        }
+        
+        if training_status.get('is_training'):
+            training_started = training_status.get('training_started')
+            if training_started:
+                elapsed = (datetime.datetime.utcnow() - training_started).total_seconds() / 60
+                remaining = max(0, 5 - elapsed)
+                response['elapsed_minutes'] = round(elapsed, 1)
+                response['remaining_minutes'] = round(remaining, 1)
+                response['progress_percentage'] = min(100, int((elapsed / 5) * 100))
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/start-ml-training', methods=['POST'])
+@token_required
+def start_ml_training_route(current_user):
+    try:
+        user = users_collection.find_one({'email': current_user['email']})
+        device_count = len(user.get('devices', [])) if user else 0
+        
+        if device_count < 2:
+            return jsonify({
+                'success': False,
+                'message': f'Need 2+ devices to start ML training. Currently have {device_count}.'
+            }), 400
+        
+        training_status = behavior_analyzer.get_training_status(current_user['email'])
+        if training_status and (training_status.get('is_training') or training_status.get('is_trained')):
+            return jsonify({
+                'success': False,
+                'message': 'ML training already in progress or completed'
+            }), 400
+        
+        success = start_ml_training(current_user['email'])
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': 'ML training started successfully. Will train for 5 minutes.',
+                'estimated_completion': (datetime.datetime.utcnow() + datetime.timedelta(minutes=5)).isoformat()
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Failed to start ML training'
+            }), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/device-patterns', methods=['GET'])
+@token_required
+def get_device_patterns(current_user):
+    try:
+        user = users_collection.find_one({'email': current_user['email']})
+        if not user:
+            return jsonify({'patterns': {}}), 200
+        
+        device_patterns = {}
+        for device_id in user.get('devices', []):
+            pattern = behavior_analyzer.get_device_pattern(current_user['email'], device_id)
+            if pattern:
+                pattern.pop('_id', None)
+                
+                if 'section_visits' in pattern:
+                    total_visits = sum(pattern['section_visits'].values())
+                    pattern['section_percentages'] = {
+                        section: (count / total_visits * 100) if total_visits > 0 else 0
+                        for section, count in pattern['section_visits'].items()
+                    }
+                
+                device_patterns[device_id] = pattern
+        
+        return jsonify({
+            'patterns': device_patterns,
+            'device_count': len(device_patterns)
         }), 200
         
     except Exception as e:
@@ -1280,16 +1807,29 @@ def system_status(current_user):
         user_count = users_collection.count_documents({})
         device_count = devices_collection.count_documents({})
         location_count = locations_collection.count_documents({})
+        behavior_count = behavior_analyzer.behavior_collection.count_documents({})
         connected_devices_count = device_connections_collection.count_documents({'is_online': True})
+        
+        models_dir = 'models'
+        trained_models = 0
+        if os.path.exists(models_dir):
+            trained_models = len([f for f in os.listdir(models_dir) if f.endswith('.pkl')])
         
         return jsonify({
             'status': 'online',
             'users': user_count,
             'devices': device_count,
             'active_locations': location_count,
+            'behavior_records': behavior_count,
+            'trained_ml_models': trained_models,
+            'active_ml_models': len(user_models),
             'connected_devices': connected_devices_count,
+            'cache_size': len(last_location_cache),
             'timestamp': datetime.datetime.utcnow().isoformat(),
-            'multi_device_active': True
+            'multi_device_active': True,
+            'device_id_fix': 'APPLIED_V4',
+            'ua_fingerprinting': True,
+            'no_auto_device_creation': True
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1330,6 +1870,281 @@ def debug_locations(current_user):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/connected-devices', methods=['GET'])
+@token_required
+def get_connected_devices(current_user):
+    try:
+        connected_devices_list = list(device_connections_collection.find(
+            {'user_email': current_user['email'], 'is_online': True},
+            {'_id': 0, 'device_id': 1, 'connected_at': 1, 'socket_id': 1}
+        ))
+        
+        for device in connected_devices_list:
+            device_info = devices_collection.find_one(
+                {'device_id': device['device_id']},
+                {'device_name': 1, 'os': 1, '_id': 0}
+            )
+            if device_info:
+                device.update(device_info)
+        
+        return jsonify({
+            'connected_devices': connected_devices_list,
+            'count': len(connected_devices_list)
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/test-device-id', methods=['GET'])
+@token_required
+def test_device_id(current_user):
+    device_id = extract_device_id_from_request()
+    user_agent = request.headers.get('User-Agent', '')
+    normalized_ua = normalize_user_agent(user_agent)
+    ua_fingerprint = generate_ua_fingerprint(normalized_ua) if normalized_ua else None
+    
+    return jsonify({
+        'device_id_from_extract': device_id,
+        'device_id_valid': validate_device_id(device_id),
+        'user_agent': user_agent[:100],
+        'normalized_ua': normalized_ua[:100],
+        'ua_fingerprint': ua_fingerprint[:20] if ua_fingerprint else None,
+        'request_args': dict(request.args),
+        'request_headers': dict(request.headers),
+        'socket_id': request.sid if hasattr(request, 'sid') else None,
+        'user_email': current_user['email']
+    })
+
+@app.route('/api/simulate-location', methods=['POST'])
+@token_required
+def simulate_location(current_user):
+    try:
+        data = request.json
+        device_id = data.get('device_id')
+        latitude = data.get('latitude', 40.7128)
+        longitude = data.get('longitude', -74.0060)
+        accuracy = data.get('accuracy', 10)
+        
+        if not device_id:
+            user = users_collection.find_one({'email': current_user['email']})
+            if user and 'devices' in user and len(user['devices']) > 0:
+                device_id = user['devices'][0]
+            else:
+                return jsonify({'error': 'No device found for user'}), 400
+        
+        update_data = {
+            'device_id': device_id,
+            'user_email': current_user['email'],
+            'latitude': latitude,
+            'longitude': longitude,
+            'accuracy': accuracy
+        }
+        
+        connection = device_connections_collection.find_one({
+            'device_id': device_id,
+            'user_email': current_user['email'],
+            'is_online': True
+        })
+        
+        if connection:
+            socket_id = connection.get('socket_id')
+            try:
+                socketio.emit('update_location', update_data, room=socket_id)
+                return jsonify({
+                    'success': True,
+                    'message': 'Location simulation sent via WebSocket',
+                    'data': update_data
+                })
+            except Exception as e:
+                return jsonify({
+                    'success': False,
+                    'message': f'WebSocket error: {str(e)}',
+                    'data': update_data
+                })
+        else:
+            current_time = datetime.datetime.utcnow()
+            
+            device_locations_collection.update_one(
+                {'device_id': device_id},
+                {
+                    '$set': {
+                        'device_id': device_id,
+                        'device_name': 'Test Device',
+                        'os': 'Test',
+                        'latitude': latitude,
+                        'longitude': longitude,
+                        'accuracy': accuracy,
+                        'user_email': current_user['email'],
+                        'current_section': 'Outside Campus',
+                        'timestamp': current_time,
+                        'is_online': True
+                    }
+                },
+                upsert=True
+            )
+            
+            return jsonify({
+                'success': True,
+                'message': 'Location simulation stored in database',
+                'data': update_data
+            })
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/force-connect', methods=['POST'])
+@token_required
+def force_connect(current_user):
+    device_id = request.json.get('device_id')
+    if not device_id:
+        return jsonify({'error': 'Device ID required'}), 400
+    
+    device_connections_collection.delete_one({'device_id': device_id})
+    
+    return jsonify({
+        'success': True,
+        'message': 'Connection cleaned up. Please reconnect from frontend.',
+        'device_id': device_id
+    })
+
+@app.route('/api/debug/fingerprints', methods=['GET'])
+@token_required
+def debug_fingerprints(current_user):
+    try:
+        user_devices = list(devices_collection.find(
+            {'user_email': current_user['email']},
+            {'device_id': 1, 'device_name': 1, 'ua_fingerprint': 1, 'user_agent': 1, '_id': 0}
+        ))
+        
+        current_ua = request.headers.get('User-Agent', '')
+        normalized_current = normalize_user_agent(current_ua)
+        current_fingerprint = generate_ua_fingerprint(normalized_current) if normalized_current else None
+        
+        return jsonify({
+            'user_email': current_user['email'],
+            'current_user_agent': current_ua[:200],
+            'current_normalized_ua': normalized_current[:200],
+            'current_fingerprint': current_fingerprint[:20] if current_fingerprint else None,
+            'devices': user_devices,
+            'device_count': len(user_devices)
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/fix-duplicate-devices', methods=['POST'])
+@token_required
+def fix_duplicate_devices(current_user):
+    try:
+        user_devices = list(devices_collection.find(
+            {'user_email': current_user['email']},
+            {'device_id': 1, 'ua_fingerprint': 1, 'last_seen': 1, '_id': 0}
+        ))
+        
+        fingerprints = {}
+        duplicates = []
+        
+        for device in user_devices:
+            fp = device.get('ua_fingerprint')
+            if fp:
+                if fp in fingerprints:
+                    duplicates.append({
+                        'fingerprint': fp[:20],
+                        'devices': fingerprints[fp] + [device['device_id']]
+                    })
+                else:
+                    fingerprints[fp] = [device['device_id']]
+        
+        if not duplicates:
+            return jsonify({
+                'message': 'No duplicate devices found by UA fingerprint',
+                'device_count': len(user_devices),
+                'unique_fingerprints': len(fingerprints)
+            }), 200
+        
+        devices_to_keep = []
+        devices_to_remove = []
+        
+        for dup in duplicates:
+            fp = dup['fingerprint']
+            device_ids = dup['devices']
+            
+            devices = list(devices_collection.find(
+                {'device_id': {'$in': device_ids}},
+                {'device_id': 1, 'last_seen': 1}
+            ).sort('last_seen', -1))
+            
+            if devices:
+                devices_to_keep.append(devices[0]['device_id'])
+                for i in range(1, len(devices)):
+                    devices_to_remove.append(devices[i]['device_id'])
+        
+        response = {
+            'duplicates_found': len(duplicates),
+            'devices_to_keep': devices_to_keep,
+            'devices_to_remove': devices_to_remove,
+            'fingerprint_duplicates': duplicates
+        }
+        
+        confirm = request.json.get('confirm', False)
+        if confirm:
+            for device_id in devices_to_remove:
+                users_collection.update_one(
+                    {'email': current_user['email']},
+                    {'$pull': {'devices': device_id}}
+                )
+                
+                devices_collection.delete_one({'device_id': device_id})
+                
+                print(f"Removed duplicate device: {device_id[:20]}...")
+            
+            response['removed_count'] = len(devices_to_remove)
+            response['message'] = f'Removed {len(devices_to_remove)} duplicate devices'
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    
+    os.makedirs("models", exist_ok=True)
+    
+    print(f"Starting server on port {port}")
+    print(f"Location validation settings:")
+    print(f"   - High accuracy threshold: < {HIGH_ACCURACY_THRESHOLD}m")
+    print(f"   - Maximum acceptable accuracy: < {MAX_ACCEPTABLE_ACCURACY}m")
+    print(f"   - Maximum position drift: {MAX_POSITION_DRIFT}m")
+    print(f"University system enabled - 12x12 meter sections")
+    print(f"ENHANCED ML Anomaly Detection: Active")
+    print(f"WebSocket enabled with threading mode")
+    print(f"CRITICAL DEVICE REGISTRATION FIX APPLIED:")
+    print(f"   - REMOVED auto-device creation from join_room handler")
+    print(f"   - Devices ONLY created via /api/add-device endpoint")
+    print(f"   - join_room now validates device exists and belongs to user")
+    print(f"   - No more duplicate device entries")
+    print(f"UA FINGERPRINTING SYSTEM ENABLED:")
+    print(f"   - Stores SHA-256 hash of normalized User-Agent")
+    print(f"   - Detects same browser even after localStorage cleared")
+    print(f"   - Auto-migrates device history when fingerprint matches")
+    print(f"FIXED REGISTRATION & LOGIN FLOW:")
+    print(f"   - Registration: Creates user account ONLY (no device)")
+    print(f"   - Login: NO automatic device registration")
+    print(f"   - Device check: Detects if device needs to be added or migrated")
+    print(f"   - Add device: UA fingerprint matching and migration")
+    print(f"Device workflow:")
+    print(f"   1. User registers → Account created (no device)")
+    print(f"   2. User logs in → Dashboard loads")
+    print(f"   3. Dashboard checks device → Shows add device form if needed")
+    print(f"   4. If UA fingerprint matches existing device → Auto-migration")
+    print(f"   5. User adds device → Device created with fingerprint")
+    print(f"   6. WebSocket join_room → Validates device registration")
+    print(f"   7. Location permission requested → Tracking enabled")
+    print(f"   8. 2+ devices → ML learning starts automatically")
+    print(f"Debug endpoints available:")
+    print(f"   - /api/test-device-id")
+    print(f"   - /api/debug/fingerprints")
+    print(f"   - /api/fix-duplicate-devices")
+    print(f"   - /api/simulate-location")
+    print(f"   - /api/force-connect")
+    
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
