@@ -42,8 +42,8 @@ socketio = SocketIO(
     ping_interval=25,
     max_http_buffer_size=1e8,
     transports=['websocket', 'polling'],
-    logger=True,
-    engineio_logger=True
+    logger=True,  # ✅ Enable for debugging
+    engineio_logger=True  # ✅ Enable for debugging
 )
 
 bcrypt = Bcrypt(app)
@@ -1202,7 +1202,7 @@ def health_check():
             'cache_size': len(last_location_cache),
             'multi_device_support': True,
             'device_id_fix': 'APPLIED_V3',
-            'no_auto_device_creation': True
+            'no_auto_device_creation': True  # ✅ Added flag
         }), 200
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
@@ -1216,6 +1216,8 @@ def register():
         email = data.get('email')
         password = data.get('password')
         
+        # ✅ NO device_id or device_info required
+        
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
         
@@ -1224,11 +1226,12 @@ def register():
         
         hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
         
+        # ✅ Create user account ONLY - NO devices
         user = {
             'email': email,
             'password': hashed_password,
             'created_at': datetime.datetime.utcnow(),
-            'devices': [],
+            'devices': [],  # Empty devices list
             'location_permission': False,
             'last_login': datetime.datetime.utcnow()
         }
@@ -1262,6 +1265,8 @@ def login():
         data = request.json
         email = data.get('email')
         password = data.get('password')
+        
+        # ✅ NO device_id or device_info required
         
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
@@ -1297,7 +1302,7 @@ def login():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ================ UPDATED CHECK-DEVICE - WITH PER-DEVICE PERMISSION ================
+# ================ UPDATED CHECK-DEVICE - PROPER DEVICE DETECTION ================
 
 @app.route('/api/check-device', methods=['GET'])
 @token_required
@@ -1326,10 +1331,7 @@ def check_device(current_user):
         device_status = 'not_registered'
         device_owner = None
         
-        # ✅ FIXED: Get device-specific location permission
-        device_location_permission = False
         if device:
-            device_location_permission = device.get('location_tracking', False)
             if device['user_email'] == current_user['email']:
                 device_status = 'registered_to_me'
                 device_owner = current_user['email']
@@ -1337,7 +1339,7 @@ def check_device(current_user):
                 device_status = 'registered_to_other'
                 device_owner = device['user_email']
         
-        print(f"🔍 Device check: {device_id[:20]}... - Status: {device_status} - Permission: {device_location_permission}")
+        print(f"🔍 Device check: {device_id[:20]}... - Status: {device_status}")
         
         return jsonify({
             'device_id': device_id,
@@ -1346,8 +1348,7 @@ def check_device(current_user):
             'device_status': device_status,
             'device_owner': device_owner,
             'os': os,
-            'location_permission': device_location_permission,  # ✅ Device-specific permission
-            'user_location_permission': user.get('location_permission', False)  # Keep global for backward compatibility
+            'location_permission': user.get('location_permission', False) if user else False
         }), 200
         
     except Exception as e:
@@ -1387,7 +1388,7 @@ def add_device(current_user):
         os = detect_os(user_agent)
         browser = detect_browser(user_agent)
         
-        # Create device record with location_tracking: False by default
+        # Create device record
         device = {
             'device_id': device_id,
             'device_name': device_name,
@@ -1418,8 +1419,7 @@ def add_device(current_user):
             'user_has_device': True,
             'device_status': 'registered_to_me',
             'device_owner': current_user['email'],
-            'os': os,
-            'location_permission': False  # New devices don't have permission yet
+            'os': os
         }
         
         # Check if ML training should start
@@ -1465,7 +1465,7 @@ def get_user_devices(current_user):
                 'device_id': 1,
                 'device_name': 1,
                 'os': 1,
-                'location_tracking': 1,  # Include device-specific permission
+                'location_tracking': 1,
                 'last_seen': 1,
                 'current_section': 1,
                 '_id': 0
@@ -1489,8 +1489,6 @@ def get_user_devices(current_user):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ================ UPDATED GRANT-LOCATION-PERMISSION - PER-DEVICE PERMISSION ================
-
 @app.route('/api/grant-location-permission', methods=['POST'])
 @token_required
 def grant_location_permission(current_user):
@@ -1513,7 +1511,6 @@ def grant_location_permission(current_user):
         
         university_exists = university_collection.find_one({'user_email': current_user['email']})
         
-        # ✅ Create university ONLY if it doesn't exist (first device grants permission)
         if not university_exists and initial_latitude and initial_longitude:
             try:
                 center_lat = float(initial_latitude)
@@ -1537,13 +1534,11 @@ def grant_location_permission(current_user):
             except ValueError:
                 return jsonify({'error': 'Invalid coordinates'}), 400
         
-        # ✅ Update user's global permission (for backward compatibility)
         users_collection.update_one(
             {'email': current_user['email']},
             {'$set': {'location_permission': True}}
         )
         
-        # ✅ CRITICAL FIX: Update THIS device's location tracking
         devices_collection.update_one(
             {'device_id': device_id},
             {'$set': {'location_tracking': True}}
@@ -1778,8 +1773,7 @@ def system_status(current_user):
             'timestamp': datetime.datetime.utcnow().isoformat(),
             'multi_device_active': True,
             'device_id_fix': 'APPLIED_V3',
-            'no_auto_device_creation': True,
-            'per_device_permission': True  # ✅ New flag
+            'no_auto_device_creation': True  # ✅ Added flag
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1983,17 +1977,13 @@ if __name__ == '__main__':
     print(f"   - Login: NO automatic device registration")
     print(f"   - Device check: Detects if device needs to be added")
     print(f"   - Add device: Proper validation and permission flow")
-    print(f"✅ FIXED PER-DEVICE LOCATION PERMISSION:")
-    print(f"   - Each device has its own location_tracking field")
-    print(f"   - Second device will see LocationPermission modal")
-    print(f"   - Auto-tracking checks device-specific permission")
     print(f"🔍 Device workflow:")
     print(f"   1. User registers → Account created (no device)")
     print(f"   2. User logs in → Dashboard loads")
     print(f"   3. Dashboard checks device → Shows add device form if needed")
     print(f"   4. User adds device via /api/add-device → Device created")
     print(f"   5. WebSocket join_room → Validates device registration")
-    print(f"   6. Location permission requested → Tracking enabled for THIS device")
+    print(f"   6. Location permission requested → Tracking enabled")
     print(f"   7. 2+ devices → ML learning starts automatically")
     print(f"🔍 Debug endpoints available:")
     print(f"   - /api/test-device-id")
