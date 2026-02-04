@@ -24,25 +24,26 @@ load_dotenv()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-here')
+app.config['CORS_HEADERS'] = 'Content-Type,Authorization'
 
-# ✅ FIXED: Simplified CORS configuration - only one configuration
+# Configure CORS for WebSocket compatibility
 CORS(app, 
-     origins=["https://track-device-frontend.vercel.app", "http://localhost:3000"],
+     resources={r"/*": {"origins": "*"}},
      supports_credentials=True,
-     allow_headers=["Content-Type", "Authorization", "X-Device-ID", "X-Requested-With"],
+     allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Device-ID"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
 # Enhanced WebSocket configuration for Render.com
 socketio = SocketIO(
     app,
-    cors_allowed_origins=["https://track-device-frontend.vercel.app", "http://localhost:3000"],
+    cors_allowed_origins="*",
     async_mode='threading',
     ping_timeout=60,
     ping_interval=25,
     max_http_buffer_size=1e8,
     transports=['websocket', 'polling'],
-    logger=True,
-    engineio_logger=True
+    logger=True,  # ✅ Enable for debugging
+    engineio_logger=True  # ✅ Enable for debugging
 )
 
 bcrypt = Bcrypt(app)
@@ -660,6 +661,15 @@ def serialize_document(document):
             document[key] = str(value)
     return document
 
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,X-Socket-ID,X-Device-ID')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    response.headers.add('Access-Control-Max-Age', '86400')
+    return response
+
 # ================ UPDATED WEB SOCKET HANDLERS ================
 
 @socketio.on('connect')
@@ -1192,10 +1202,12 @@ def health_check():
             'cache_size': len(last_location_cache),
             'multi_device_support': True,
             'device_id_fix': 'APPLIED_V3',
-            'no_auto_device_creation': True
+            'no_auto_device_creation': True  # ✅ Added flag
         }), 200
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
+
+# ================ UPDATED REGISTRATION - NO DEVICE REGISTRATION ================
 
 @app.route('/api/register', methods=['POST'])
 def register():
@@ -1203,6 +1215,8 @@ def register():
         data = request.json
         email = data.get('email')
         password = data.get('password')
+        
+        # ✅ NO device_id or device_info required
         
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
@@ -1212,11 +1226,12 @@ def register():
         
         hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
         
+        # ✅ Create user account ONLY - NO devices
         user = {
             'email': email,
             'password': hashed_password,
             'created_at': datetime.datetime.utcnow(),
-            'devices': [],
+            'devices': [],  # Empty devices list
             'location_permission': False,
             'last_login': datetime.datetime.utcnow()
         }
@@ -1242,12 +1257,16 @@ def register():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ================ UPDATED LOGIN - NO DEVICE REGISTRATION ================
+
 @app.route('/api/login', methods=['POST'])
 def login():
     try:
         data = request.json
         email = data.get('email')
         password = data.get('password')
+        
+        # ✅ NO device_id or device_info required
         
         if not email or not password:
             return jsonify({'error': 'Email and password are required'}), 400
@@ -1283,6 +1302,8 @@ def login():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ================ UPDATED CHECK-DEVICE - PROPER DEVICE DETECTION ================
+
 @app.route('/api/check-device', methods=['GET'])
 @token_required
 def check_device(current_user):
@@ -1290,14 +1311,17 @@ def check_device(current_user):
         device_id = request.headers.get('X-Device-ID') or request.args.get('device_id')
         
         if not device_id:
+            # Generate fallback device ID
             user_agent = request.headers.get('User-Agent', '')
             system_info = f"{platform.system()}{platform.release()}{platform.machine()}"
             fingerprint_string = system_info + user_agent
             device_id = hashlib.sha256(fingerprint_string.encode()).hexdigest()
             print(f"⚠️ Using fallback device ID: {device_id[:20]}...")
         
+        # Check if device exists anywhere in the system
         device = devices_collection.find_one({'device_id': device_id})
         
+        # Check if current user has this device
         user = users_collection.find_one({'email': current_user['email']})
         user_has_device = device_id in user.get('devices', []) if user else False
         
@@ -1330,6 +1354,8 @@ def check_device(current_user):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ================ ADD-DEVICE ENDPOINT - WITH PROPER VALIDATION ================
+
 @app.route('/api/add-device', methods=['POST'])
 @token_required
 def add_device(current_user):
@@ -1341,6 +1367,7 @@ def add_device(current_user):
         if not device_id or not validate_device_id(device_id):
             return jsonify({'error': 'Valid Device ID is required'}), 400
         
+        # Check if device already exists in system
         existing_device = devices_collection.find_one({'device_id': device_id})
         
         if existing_device:
@@ -1352,6 +1379,7 @@ def add_device(current_user):
                     'owner': existing_device['user_email']
                 }), 400
         
+        # Check if user already has this device in their list
         user = users_collection.find_one({'email': current_user['email']})
         if device_id in user.get('devices', []):
             return jsonify({'error': 'Device already in your account'}), 400
@@ -1360,6 +1388,7 @@ def add_device(current_user):
         os = detect_os(user_agent)
         browser = detect_browser(user_agent)
         
+        # Create device record
         device = {
             'device_id': device_id,
             'device_name': device_name,
@@ -1369,13 +1398,14 @@ def add_device(current_user):
             'browser': browser,
             'user_agent': user_agent,
             'last_seen': datetime.datetime.utcnow(),
-            'location_tracking': False,
+            'location_tracking': False,  # Will be enabled when permission granted
             'current_section': 'Outside Campus'
         }
         
         result = devices_collection.insert_one(device)
         device['_id'] = str(result.inserted_id)
         
+        # Add device to user's devices list
         users_collection.update_one(
             {'email': current_user['email']},
             {'$push': {'devices': device_id}}
@@ -1392,6 +1422,7 @@ def add_device(current_user):
             'os': os
         }
         
+        # Check if ML training should start
         updated_user = users_collection.find_one({'email': current_user['email']})
         device_count = len(updated_user.get('devices', []))
         
@@ -1407,158 +1438,6 @@ def add_device(current_user):
             'ml_training_started': ml_training_started,
             'device_count': device_count
         }), 201
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# ================ ✅ CRITICAL FIX: UPDATED GRANT LOCATION PERMISSION ================
-
-@app.route('/api/grant-location-permission', methods=['POST'])
-@token_required
-def grant_location_permission(current_user):
-    try:
-        data = request.json
-        device_id = data.get('device_id')
-        initial_latitude = data.get('latitude')
-        initial_longitude = data.get('longitude')
-        
-        if not device_id:
-            return jsonify({'error': 'Device ID is required'}), 400
-        
-        device = devices_collection.find_one({
-            'device_id': device_id,
-            'user_email': current_user['email']
-        })
-        
-        if not device:
-            return jsonify({'error': 'Device not found or not authorized'}), 404
-        
-        university_exists = university_collection.find_one({'user_email': current_user['email']})
-        
-        # ✅ CRITICAL FIX: If university already exists, use its location
-        if university_exists:
-            # Just update location permission - don't create new university
-            print(f"✅ University exists for {current_user['email']}, using existing layout")
-            
-            # Verify if device is near the university (but allow anyway for demo)
-            if initial_latitude and initial_longitude:
-                try:
-                    device_lat = float(initial_latitude)
-                    device_lon = float(initial_longitude)
-                    uni_center = university_exists['center']
-                    distance = calculate_distance(
-                        device_lat, device_lon,
-                        uni_center['lat'], uni_center['lon']
-                    )
-                    
-                    # Allow up to 5000m distance (for demo purposes)
-                    if distance > 5000:
-                        print(f"⚠️ Device {device_id[:8]} is {distance:.0f}m from university - allowing anyway")
-                        return jsonify({
-                            'warning': f'Device is {distance:.0f}m from university center. Permission granted but tracking may be limited.',
-                            'university_center': uni_center,
-                            'location_permission': True,
-                            'device_id': device_id,
-                            'university': serialize_document(university_exists)
-                        }), 200
-                except Exception as e:
-                    print(f"⚠️ Distance calculation error: {e}")
-        
-        elif initial_latitude and initial_longitude:
-            # Create new university (first device)
-            try:
-                center_lat = float(initial_latitude)
-                center_lon = float(initial_longitude)
-                
-                sections = generate_university_layout(center_lat, center_lon)
-                
-                university_data = {
-                    'user_email': current_user['email'],
-                    'center': {
-                        'lat': center_lat,
-                        'lon': center_lon
-                    },
-                    'sections': sections,
-                    'created_at': datetime.datetime.utcnow(),
-                    'total_size_meters': UNIVERSITY_SIZE * 111000
-                }
-                
-                university_collection.insert_one(university_data)
-                print(f"🏛️ University created at {center_lat}, {center_lon}")
-            except ValueError:
-                return jsonify({'error': 'Invalid coordinates'}), 400
-        else:
-            # No coordinates provided - still grant permission
-            print(f"⚠️ No coordinates provided for device {device_id[:8]}, but granting permission anyway")
-        
-        # Grant permission regardless of location
-        users_collection.update_one(
-            {'email': current_user['email']},
-            {'$set': {'location_permission': True}}
-        )
-        
-        devices_collection.update_one(
-            {'device_id': device_id},
-            {'$set': {'location_tracking': True}}
-        )
-        
-        university_data = university_collection.find_one({'user_email': current_user['email']})
-        
-        return jsonify({
-            'message': 'Location permission granted successfully',
-            'location_permission': True,
-            'device_id': device_id,
-            'university': serialize_document(university_data) if university_data else None
-        }), 200
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# ================ ✅ NEW: FORCE LOCATION PERMISSION ENDPOINT ================
-
-@app.route('/api/force-location-permission', methods=['POST'])
-@token_required
-def force_location_permission(current_user):
-    """Force location permission for second device without location check"""
-    try:
-        data = request.json
-        device_id = data.get('device_id')
-        
-        if not device_id:
-            return jsonify({'error': 'Device ID is required'}), 400
-        
-        # Check if device belongs to user
-        device = devices_collection.find_one({
-            'device_id': device_id,
-            'user_email': current_user['email']
-        })
-        
-        if not device:
-            return jsonify({'error': 'Device not found'}), 404
-        
-        # Check if university exists
-        university_exists = university_collection.find_one({'user_email': current_user['email']})
-        
-        if not university_exists:
-            return jsonify({'error': 'No university found. Enable location on first device first.'}), 400
-        
-        # Grant permission
-        users_collection.update_one(
-            {'email': current_user['email']},
-            {'$set': {'location_permission': True}}
-        )
-        
-        devices_collection.update_one(
-            {'device_id': device_id},
-            {'$set': {'location_tracking': True}}
-        )
-        
-        return jsonify({
-            'message': 'Location permission forced successfully',
-            'location_permission': True,
-            'device_id': device_id,
-            'university': serialize_document(university_exists)
-        }), 200
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1606,6 +1485,73 @@ def get_user_devices(current_user):
                 device['is_online'] = False
         
         return jsonify({'devices': devices}), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/grant-location-permission', methods=['POST'])
+@token_required
+def grant_location_permission(current_user):
+    try:
+        data = request.json
+        device_id = data.get('device_id')
+        initial_latitude = data.get('latitude')
+        initial_longitude = data.get('longitude')
+        
+        if not device_id:
+            return jsonify({'error': 'Device ID is required'}), 400
+        
+        device = devices_collection.find_one({
+            'device_id': device_id,
+            'user_email': current_user['email']
+        })
+        
+        if not device:
+            return jsonify({'error': 'Device not found or not authorized'}), 404
+        
+        university_exists = university_collection.find_one({'user_email': current_user['email']})
+        
+        if not university_exists and initial_latitude and initial_longitude:
+            try:
+                center_lat = float(initial_latitude)
+                center_lon = float(initial_longitude)
+                
+                sections = generate_university_layout(center_lat, center_lon)
+                
+                university_data = {
+                    'user_email': current_user['email'],
+                    'center': {
+                        'lat': center_lat,
+                        'lon': center_lon
+                    },
+                    'sections': sections,
+                    'created_at': datetime.datetime.utcnow(),
+                    'total_size_meters': UNIVERSITY_SIZE * 111000
+                }
+                
+                university_collection.insert_one(university_data)
+                print(f"🏛️ University created at {center_lat}, {center_lon}")
+            except ValueError:
+                return jsonify({'error': 'Invalid coordinates'}), 400
+        
+        users_collection.update_one(
+            {'email': current_user['email']},
+            {'$set': {'location_permission': True}}
+        )
+        
+        devices_collection.update_one(
+            {'device_id': device_id},
+            {'$set': {'location_tracking': True}}
+        )
+        
+        university_data = university_collection.find_one({'user_email': current_user['email']})
+        
+        return jsonify({
+            'message': 'Location permission granted successfully',
+            'location_permission': True,
+            'device_id': device_id,
+            'university': serialize_document(university_data) if university_data else None
+        }), 200
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1827,7 +1773,7 @@ def system_status(current_user):
             'timestamp': datetime.datetime.utcnow().isoformat(),
             'multi_device_active': True,
             'device_id_fix': 'APPLIED_V3',
-            'no_auto_device_creation': True
+            'no_auto_device_creation': True  # ✅ Added flag
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1921,12 +1867,14 @@ def simulate_location(current_user):
         accuracy = data.get('accuracy', 10)
         
         if not device_id:
+            # Use first device of user
             user = users_collection.find_one({'email': current_user['email']})
             if user and 'devices' in user and len(user['devices']) > 0:
                 device_id = user['devices'][0]
             else:
                 return jsonify({'error': 'No device found for user'}), 400
         
+        # Create simulated location update
         update_data = {
             'device_id': device_id,
             'user_email': current_user['email'],
@@ -1935,6 +1883,7 @@ def simulate_location(current_user):
             'accuracy': accuracy
         }
         
+        # Trigger location update via WebSocket if connected
         connection = device_connections_collection.find_one({
             'device_id': device_id,
             'user_email': current_user['email'],
@@ -1957,6 +1906,7 @@ def simulate_location(current_user):
                     'data': update_data
                 })
         else:
+            # Manual update
             current_time = datetime.datetime.utcnow()
             
             device_locations_collection.update_one(
@@ -1995,6 +1945,7 @@ def force_connect(current_user):
     if not device_id:
         return jsonify({'error': 'Device ID required'}), 400
     
+    # Clean up any existing connection
     device_connections_collection.delete_one({'device_id': device_id})
     
     return jsonify({
@@ -2002,80 +1953,6 @@ def force_connect(current_user):
         'message': 'Connection cleaned up. Please reconnect from frontend.',
         'device_id': device_id
     })
-
-# ================ ✅ NEW: DEBUG DEVICE STATUS ENDPOINT ================
-
-@app.route('/api/debug/device-status', methods=['GET'])
-@token_required
-def debug_device_status(current_user):
-    """Debug endpoint to check all device status"""
-    devices = list(devices_collection.find({'user_email': current_user['email']}))
-    university = university_collection.find_one({'user_email': current_user['email']})
-    
-    result = {
-        'user_email': current_user['email'],
-        'total_devices': len(devices),
-        'devices': [],
-        'university_exists': university is not None,
-        'location_permission': current_user.get('location_permission', False)
-    }
-    
-    for device in devices:
-        device_data = serialize_document(device)
-        device_data['is_online'] = device_connections_collection.find_one({
-            'device_id': device['device_id'],
-            'is_online': True
-        }) is not None
-        result['devices'].append(device_data)
-    
-    return jsonify(result), 200
-
-# ================ ✅ NEW: FIX DEVICE PERMISSIONS ENDPOINT ================
-
-@app.route('/api/fix-device-permissions', methods=['POST'])
-@token_required
-def fix_device_permissions(current_user):
-    """Fix all device permissions for a user"""
-    try:
-        user = users_collection.find_one({'email': current_user['email']})
-        
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
-        
-        device_ids = user.get('devices', [])
-        fixed_devices = []
-        
-        for device_id in device_ids:
-            # Enable location tracking for all devices
-            devices_collection.update_one(
-                {'device_id': device_id, 'user_email': current_user['email']},
-                {'$set': {'location_tracking': True}}
-            )
-            
-            # Update device_locations
-            device_locations_collection.update_one(
-                {'device_id': device_id},
-                {'$set': {'is_online': True, 'last_seen': datetime.datetime.utcnow()}},
-                upsert=True
-            )
-            
-            fixed_devices.append(device_id)
-        
-        # Ensure user has location permission
-        users_collection.update_one(
-            {'email': current_user['email']},
-            {'$set': {'location_permission': True}}
-        )
-        
-        return jsonify({
-            'success': True,
-            'message': f'Fixed permissions for {len(fixed_devices)} devices',
-            'fixed_devices': fixed_devices,
-            'location_permission': True
-        }), 200
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
@@ -2108,16 +1985,9 @@ if __name__ == '__main__':
     print(f"   5. WebSocket join_room → Validates device registration")
     print(f"   6. Location permission requested → Tracking enabled")
     print(f"   7. 2+ devices → ML learning starts automatically")
-    print(f"🔧 CRITICAL FIXES FOR SECOND DEVICE:")
-    print(f"   - Updated /api/grant-location-permission to handle existing university")
-    print(f"   - Added /api/force-location-permission endpoint")
-    print(f"   - Added /api/fix-device-permissions endpoint")
-    print(f"   - Relaxed distance checking for demo purposes")
     print(f"🔍 Debug endpoints available:")
     print(f"   - /api/test-device-id")
     print(f"   - /api/simulate-location")
     print(f"   - /api/force-connect")
-    print(f"   - /api/debug/device-status")
-    print(f"   - /api/fix-device-permissions")
     
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
