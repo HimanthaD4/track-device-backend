@@ -1303,7 +1303,6 @@ def login():
         return jsonify({'error': str(e)}), 500
 
 # ================ UPDATED CHECK-DEVICE - PROPER DEVICE DETECTION ================
-# ✅ CRITICAL FIX: Updated to return device-level location_tracking instead of user-level location_permission
 
 @app.route('/api/check-device', methods=['GET'])
 @token_required
@@ -1331,21 +1330,16 @@ def check_device(current_user):
         
         device_status = 'not_registered'
         device_owner = None
-        # ✅ CRITICAL FIX: Default to False - will be set based on device-level tracking
-        location_permission = False
         
         if device:
             if device['user_email'] == current_user['email']:
                 device_status = 'registered_to_me'
                 device_owner = current_user['email']
-                # ✅ CRITICAL FIX: Return device-level location_tracking, not user-level
-                location_permission = device.get('location_tracking', False)
-                print(f"✅ Device {device_id[:12]}... location_tracking: {location_permission}")
             else:
                 device_status = 'registered_to_other'
                 device_owner = device['user_email']
         
-        print(f"🔍 Device check: {device_id[:20]}... - Status: {device_status}, Location Permission: {location_permission}")
+        print(f"🔍 Device check: {device_id[:20]}... - Status: {device_status}")
         
         return jsonify({
             'device_id': device_id,
@@ -1354,7 +1348,7 @@ def check_device(current_user):
             'device_status': device_status,
             'device_owner': device_owner,
             'os': os,
-            'location_permission': location_permission  # ✅ Now returns device-level permission
+            'location_permission': user.get('location_permission', False) if user else False
         }), 200
         
     except Exception as e:
@@ -1495,9 +1489,6 @@ def get_user_devices(current_user):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ================ UPDATED GRANT-LOCATION-PERMISSION ENDPOINT ================
-# ✅ CRITICAL FIX: Updated to properly set device-level location_tracking = True
-
 @app.route('/api/grant-location-permission', methods=['POST'])
 @token_required
 def grant_location_permission(current_user):
@@ -1510,11 +1501,6 @@ def grant_location_permission(current_user):
         if not device_id:
             return jsonify({'error': 'Device ID is required'}), 400
         
-        # ✅ Validate device_id
-        if not validate_device_id(device_id):
-            return jsonify({'error': 'Invalid Device ID'}), 400
-        
-        # Verify device belongs to user
         device = devices_collection.find_one({
             'device_id': device_id,
             'user_email': current_user['email']
@@ -1523,9 +1509,6 @@ def grant_location_permission(current_user):
         if not device:
             return jsonify({'error': 'Device not found or not authorized'}), 404
         
-        print(f"🔐 Granting location permission for device: {device_id[:20]}...")
-        
-        # Check if university needs to be created
         university_exists = university_collection.find_one({'user_email': current_user['email']})
         
         if not university_exists and initial_latitude and initial_longitude:
@@ -1551,23 +1534,14 @@ def grant_location_permission(current_user):
             except ValueError:
                 return jsonify({'error': 'Invalid coordinates'}), 400
         
-        # ✅ CRITICAL FIX: Update DEVICE-LEVEL location_tracking
-        devices_collection.update_one(
-            {'device_id': device_id},
-            {
-                '$set': {
-                    'location_tracking': True,
-                    'location_permission_granted_at': datetime.datetime.utcnow()
-                }
-            }
-        )
-        
-        print(f"✅ Location permission granted for device {device_id[:20]}")
-        
-        # Also update user-level for backwards compatibility
         users_collection.update_one(
             {'email': current_user['email']},
             {'$set': {'location_permission': True}}
+        )
+        
+        devices_collection.update_one(
+            {'device_id': device_id},
+            {'$set': {'location_tracking': True}}
         )
         
         university_data = university_collection.find_one({'user_email': current_user['email']})
@@ -1580,8 +1554,6 @@ def grant_location_permission(current_user):
         }), 200
         
     except Exception as e:
-        print(f"❌ Error granting location permission: {e}")
-        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/university-layout', methods=['GET'])
@@ -2005,17 +1977,13 @@ if __name__ == '__main__':
     print(f"   - Login: NO automatic device registration")
     print(f"   - Device check: Detects if device needs to be added")
     print(f"   - Add device: Proper validation and permission flow")
-    print(f"🔍 DEVICE-LEVEL LOCATION PERMISSION FIX APPLIED:")
-    print(f"   - check-device endpoint now returns device.location_tracking")
-    print(f"   - grant-location-permission sets device.location_tracking = True")
-    print(f"   - Each device now has its own permission status")
     print(f"🔍 Device workflow:")
     print(f"   1. User registers → Account created (no device)")
     print(f"   2. User logs in → Dashboard loads")
     print(f"   3. Dashboard checks device → Shows add device form if needed")
     print(f"   4. User adds device via /api/add-device → Device created")
     print(f"   5. WebSocket join_room → Validates device registration")
-    print(f"   6. Location permission requested → Device-level tracking enabled")
+    print(f"   6. Location permission requested → Tracking enabled")
     print(f"   7. 2+ devices → ML learning starts automatically")
     print(f"🔍 Debug endpoints available:")
     print(f"   - /api/test-device-id")
