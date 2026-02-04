@@ -1337,7 +1337,14 @@ def check_device(current_user):
                 device_status = 'registered_to_other'
                 device_owner = device['user_email']
         
-        print(f"🔍 Device check: {device_id[:20]}... - Status: {device_status} - Permission: {device_location_permission}")
+        # ✅ ADD THIS DEBUG LOGGING
+        print(f"🔍 DEBUG /check-device for {current_user['email']}:")
+        print(f"   Device ID: {device_id[:20]}")
+        print(f"   Device exists in DB: {device is not None}")
+        print(f"   Device location_tracking in DB: {device_location_permission if device else 'N/A'}")
+        print(f"   Device status: {device_status}")
+        print(f"   User has device: {user_has_device}")
+        print(f"   User permission: {user.get('location_permission', False) if user else False}")
         
         return jsonify({
             'device_id': device_id,
@@ -1351,6 +1358,8 @@ def check_device(current_user):
         }), 200
         
     except Exception as e:
+        print(f"❌ Error in check_device: {str(e)}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 # ================ ADD-DEVICE ENDPOINT - WITH PROPER VALIDATION ================
@@ -1397,9 +1406,12 @@ def add_device(current_user):
             'browser': browser,
             'user_agent': user_agent,
             'last_seen': datetime.datetime.utcnow(),
-            'location_tracking': False,  # Will be enabled when permission granted
+            'location_tracking': False,  # ✅ CRITICAL: Must be False for new devices
             'current_section': 'Outside Campus'
         }
+        
+        # ✅ DEBUG LOGGING
+        print(f"🔧 DEBUG Creating device with location_tracking: {device['location_tracking']}")
         
         result = devices_collection.insert_one(device)
         device['_id'] = str(result.inserted_id)
@@ -1419,7 +1431,7 @@ def add_device(current_user):
             'device_status': 'registered_to_me',
             'device_owner': current_user['email'],
             'os': os,
-            'location_permission': False  # New devices don't have permission yet
+            'location_permission': False  # ✅ Must be False for new devices
         }
         
         # Check if ML training should start
