@@ -328,22 +328,25 @@ def constrain_location_to_radius(new_lat, new_lon, anchor_lat, anchor_lon, max_r
     return constrained_lat, constrained_lon, distance
 
 def validate_and_constrain_location(device_id, latitude, longitude, accuracy):
-    """RELAXED VALIDATION FOR DEMO"""
+    """REMOVED ACCURACY VALIDATION - ACCEPT ALL LOCATIONS"""
     if not validate_device_id(device_id):
         print(f"❌ INVALID device_id in validation: {device_id}")
         return None, None, None, False, "invalid_device_id"
     
-    if accuracy > MAX_ACCEPTABLE_ACCURACY:
-        print(f"⚠️ WARNING: Device {device_id[:8]}... accuracy {accuracy:.1f}m")
+    # REMOVED accuracy validation - accept all locations
+    # if accuracy > MAX_ACCEPTABLE_ACCURACY:
+    #     print(f"⚠️ WARNING: Device {device_id[:8]}... accuracy {accuracy:.1f}m")
+    #     # You could still log it but not reject
     
     last_location = locations_collection.find_one(
         {'device_id': device_id}, 
         sort=[('timestamp', -1)]
     )
     
-    if accuracy < HIGH_ACCURACY_THRESHOLD:
-        print(f"✅ HIGH ACCURACY: Device {device_id[:8]}... {accuracy:.1f}m - ACCEPTED")
-        return latitude, longitude, accuracy, True, "high_accuracy_accepted"
+    # REMOVED high accuracy threshold check
+    # if accuracy < HIGH_ACCURACY_THRESHOLD:
+    #     print(f"✅ HIGH ACCURACY: Device {device_id[:8]}... {accuracy:.1f}m - ACCEPTED")
+    #     return latitude, longitude, accuracy, True, "high_accuracy_accepted"
     
     if last_location and 'latitude' in last_location and 'longitude' in last_location:
         anchor_lat = last_location['latitude']
@@ -354,10 +357,10 @@ def validate_and_constrain_location(device_id, latitude, longitude, accuracy):
             constrained_lat, constrained_lon, actual_distance = constrain_location_to_radius(
                 latitude, longitude, anchor_lat, anchor_lon, MAX_POSITION_DRIFT
             )
-            print(f"🔒 CONSTRAINED: Device {device_id[:8]}... moved {actual_distance:.1f}m")
+            print(f"🔒 CONSTRAINED: Device {device_id[:8]}... moved {actual_distance:.1f}m (accuracy: {accuracy:.1f}m)")
             return constrained_lat, constrained_lon, accuracy, True, "constrained_to_radius"
         else:
-            print(f"✅ ACCEPTED: Device {device_id[:8]}... moved {distance:.1f}m")
+            print(f"✅ ACCEPTED: Device {device_id[:8]}... moved {distance:.1f}m (accuracy: {accuracy:.1f}m)")
             return latitude, longitude, accuracy, True, "within_drift_limit"
     else:
         print(f"✅ FIRST LOCATION: Device {device_id[:8]}... accuracy {accuracy:.1f}m")
@@ -2342,8 +2345,7 @@ if __name__ == '__main__':
     
     print(f"🚀 Starting server on port {port}")
     print(f"📍 Location validation settings:")
-    print(f"   - High accuracy threshold: < {HIGH_ACCURACY_THRESHOLD}m")
-    print(f"   - Maximum acceptable accuracy: < {MAX_ACCEPTABLE_ACCURACY}m")
+    print(f"   - REMOVED accuracy validation (accept all locations)")
     print(f"   - Maximum position drift: {MAX_POSITION_DRIFT}m")
     print(f"🏛️ University system enabled - 12x12 meter sections")
     print(f"🤖 ENHANCED ML Anomaly Detection: Active")
