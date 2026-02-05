@@ -123,6 +123,22 @@ SECTION_CONFIGS = [
 last_location_cache = {}
 CACHE_TTL = 2
 
+# ================ ENHANCED ML CONSOLE LOGGING FUNCTIONS ================
+
+def emit_ml_console_event(user_email, event_type, message, data=None):
+    """Emit ML event to console - NEW FUNCTION"""
+    try:
+        socketio.emit('ml_console_event', {
+            'type': event_type,
+            'message': message,
+            'data': data or {},
+            'timestamp': datetime.datetime.utcnow().isoformat(),
+            'source': 'backend'
+        }, room=user_email)
+        print(f"📊 [ML Console] {event_type}: {message}")
+    except Exception as e:
+        print(f"⚠️ Could not emit ML console event: {e}")
+
 # ================ ENHANCED DEVICE ID EXTRACTION ================
 def extract_device_id_from_request():
     """Extract device_id from WebSocket request - ENHANCED VERSION"""
@@ -347,9 +363,19 @@ def validate_and_constrain_location(device_id, latitude, longitude, accuracy):
         print(f"✅ FIRST LOCATION: Device {device_id[:8]}... accuracy {accuracy:.1f}m")
         return latitude, longitude, accuracy, True, "first_location_accepted"
 
+# ================ ENHANCED ML FUNCTIONS WITH CONSOLE LOGGING ================
+
 def start_ml_training(user_email):
-    """Start ML training process for user"""
+    """Start ML training process for user with enhanced console logging"""
     print(f"🚀 Starting ML training for {user_email}")
+    
+    # Emit console event
+    emit_ml_console_event(user_email, 'ml_training_started', 
+                         'ML Training Started', {
+                             'user_email': user_email,
+                             'timestamp': datetime.datetime.utcnow().isoformat(),
+                             'status': 'starting'
+                         })
     
     with model_lock:
         if user_email not in user_models:
@@ -371,15 +397,25 @@ def start_ml_training(user_email):
             'is_training': True,
             'is_trained': False,
             'training_samples': 0,
-            'message': 'ML training started. Collecting behavior data...'
+            'message': 'ML training started. Collecting behavior data...',
+            'start_time': datetime.datetime.utcnow().isoformat(),
+            'estimated_completion': (datetime.datetime.utcnow() + datetime.timedelta(minutes=5)).isoformat()
         }, room=user_email)
+        
+        # Additional console event
+        emit_ml_console_event(user_email, 'ml_training_started_detail',
+                             'Collecting behavior patterns from device movements', {
+                                 'target_samples': 50,
+                                 'target_minutes': 5,
+                                 'minimum_devices': 2
+                             })
     except Exception as e:
         print(f"⚠️ Could not emit ML status: {e}")
     
     return True
 
 def check_and_train_model(user_email):
-    """Check if ML model should be trained and train if conditions met"""
+    """Check if ML model should be trained and train if conditions met - WITH ENHANCED LOGGING"""
     with model_lock:
         if user_email not in user_models:
             user_models[user_email] = DeviceBehaviorModel(user_email)
@@ -392,6 +428,13 @@ def check_and_train_model(user_email):
         model_path = f"models/{user_email}_model.pkl"
         if model.load_model(model_path):
             print(f"📂 Loaded trained model for {user_email}")
+            
+            # Emit console event
+            emit_ml_console_event(user_email, 'ml_model_loaded',
+                                 'Pre-trained ML model loaded successfully', {
+                                     'patterns_learned': training_status.get('total_patterns_learned', 0),
+                                     'model_path': model_path
+                                 })
             return True
         else:
             behavior_analyzer.update_training_status(user_email, {
@@ -405,6 +448,14 @@ def check_and_train_model(user_email):
     
     if device_count < 2:
         print(f"⏸️ ML Training paused for {user_email}: Only {device_count} device(s)")
+        
+        # Emit console event
+        emit_ml_console_event(user_email, 'ml_training_paused',
+                             f'ML Training Paused: Need 2+ devices (currently {device_count})', {
+                                 'current_devices': device_count,
+                                 'required_devices': 2,
+                                 'status': 'waiting_for_devices'
+                             })
         return False
     
     if not training_status:
@@ -424,18 +475,39 @@ def check_and_train_model(user_email):
             'last_update': current_time
         })
         
-        try:
-            socketio.emit('ml_training_progress', {
-                'samples': sample_count,
-                'elapsed_minutes': elapsed_minutes,
-                'target_minutes': 5,
-                'message': f'Collecting behavior patterns: {sample_count}/30 samples'
-            }, room=user_email)
-        except Exception as e:
-            print(f"⚠️ Could not emit training progress: {e}")
+        # Emit progress update every 5 samples
+        if sample_count % 5 == 0:
+            try:
+                socketio.emit('ml_training_progress', {
+                    'samples': sample_count,
+                    'elapsed_minutes': elapsed_minutes,
+                    'target_minutes': 5,
+                    'progress_percentage': min(100, int((sample_count / 30) * 100)),
+                    'message': f'Collecting behavior patterns: {sample_count}/30 samples'
+                }, room=user_email)
+                
+                # Enhanced console event
+                emit_ml_console_event(user_email, 'ml_training_progress',
+                                     f'Training Progress: {sample_count}/30 samples', {
+                                         'samples': sample_count,
+                                         'target_samples': 30,
+                                         'elapsed_minutes': round(elapsed_minutes, 1),
+                                         'progress_percentage': min(100, int((sample_count / 30) * 100)),
+                                         'estimated_time_remaining': max(0, 5 - elapsed_minutes)
+                                     })
+            except Exception as e:
+                print(f"⚠️ Could not emit training progress: {e}")
         
         if sample_count >= 30 or elapsed_minutes >= 5:
             print(f"🤖 Training ML model for {user_email} with {sample_count} samples...")
+            
+            # Emit console event for training start
+            emit_ml_console_event(user_email, 'ml_model_training_start',
+                                 'Starting ML model training with collected data', {
+                                     'samples': sample_count,
+                                     'elapsed_minutes': round(elapsed_minutes, 1),
+                                     'algorithm': 'Isolation Forest + KMeans'
+                                 })
             
             device_patterns = {}
             for device_id in user.get('devices', []):
@@ -450,22 +522,40 @@ def check_and_train_model(user_email):
                 os.makedirs("models", exist_ok=True)
                 model.save_model(model_path)
                 
+                # Get model info for console
+                model_info = model.get_model_info()
+                total_patterns = len(device_patterns)
+                
                 behavior_analyzer.update_training_status(user_email, {
                     'is_training': False,
                     'is_trained': True,
                     'training_completed': datetime.datetime.utcnow(),
                     'training_samples': sample_count,
                     'model_path': model_path,
-                    'model_info': model.get_model_info()
+                    'model_info': model_info,
+                    'total_patterns_learned': total_patterns
                 })
                 
                 print(f"✅ ML Model trained successfully for {user_email}")
+                
+                # Emit detailed console event
+                emit_ml_console_event(user_email, 'ml_training_complete_detail',
+                                     'ML Model Training Complete! Anomaly detection system activated.', {
+                                         'samples_used': sample_count,
+                                         'patterns_learned': total_patterns,
+                                         'training_duration_minutes': round(elapsed_minutes, 1),
+                                         'model_info': model_info,
+                                         'anomaly_threshold': model.anomaly_threshold,
+                                         'status': 'active'
+                                     })
                 
                 try:
                     socketio.emit('ml_training_complete', {
                         'message': 'Security system activated!',
                         'samples': sample_count,
-                        'model_info': model.get_model_info()
+                        'patterns_learned': total_patterns,
+                        'model_info': model_info,
+                        'anomaly_threshold': model.anomaly_threshold
                     }, room=user_email)
                 except Exception as e:
                     print(f"⚠️ Could not emit training complete: {e}")
@@ -473,16 +563,33 @@ def check_and_train_model(user_email):
                 return True
             else:
                 print(f"❌ ML Training failed for {user_email}: {message}")
+                
+                # Emit console event for failure
+                emit_ml_console_event(user_email, 'ml_training_failed',
+                                     f'ML Training Failed: {message}', {
+                                         'error': message,
+                                         'samples': sample_count,
+                                         'status': 'failed'
+                                     })
                 return False
         else:
             remaining_samples = max(0, 30 - sample_count)
             print(f"⏳ ML Training for {user_email}: {sample_count}/30 samples")
+            
+            # Emit sample collection event for significant movements
+            if sample_count % 10 == 0:  # Every 10 samples
+                emit_ml_console_event(user_email, 'ml_sample_collection',
+                                     f'Collected {sample_count} behavior samples', {
+                                         'samples': sample_count,
+                                         'remaining_samples': remaining_samples,
+                                         'progress': f'{int((sample_count / 30) * 100)}%'
+                                     })
             return False
     
     return False
 
 def analyze_device_behavior(user_email, device_locations):
-    """Analyze device behavior and detect anomalies"""
+    """Analyze device behavior and detect anomalies - WITH ENHANCED CONSOLE LOGGING"""
     if len(device_locations) < 2:
         return None
     
@@ -504,7 +611,17 @@ def analyze_device_behavior(user_email, device_locations):
     sections = university_data['sections']
     device_list = list(valid_device_locations.values())
     
+    # Emit console event for ML analysis start
+    emit_ml_console_event(user_email, 'ml_analysis_started',
+                         'Starting ML analysis of device behavior', {
+                             'devices_analyzing': len(device_list),
+                             'sections_available': len(sections),
+                             'timestamp': datetime.datetime.utcnow().isoformat()
+                         })
+    
     meaningful_movement = False
+    movement_details = []
+    
     for device in device_list:
         last_loc = locations_collection.find_one(
             {'device_id': device['device_id']},
@@ -518,11 +635,34 @@ def analyze_device_behavior(user_email, device_locations):
             )
             if distance > 3.0:
                 meaningful_movement = True
-                break
+                movement_details.append({
+                    'device_id': device['device_id'],
+                    'distance_moved': distance,
+                    'from_section': detect_section(last_loc['latitude'], last_loc['longitude'], sections),
+                    'to_section': detect_section(device['latitude'], device['longitude'], sections)
+                })
     
     if not meaningful_movement:
         print(f"⏭️ Skipping ML analysis (no meaningful movement)")
+        
+        # Emit console event for skipped analysis
+        emit_ml_console_event(user_email, 'ml_analysis_skipped',
+                             'ML analysis skipped - no significant movement detected', {
+                                 'reason': 'insufficient_movement',
+                                 'threshold_meters': 3.0,
+                                 'max_movement_detected': max([d.get('distance', 0) for d in movement_details]) if movement_details else 0
+                             })
         return None
+    
+    # Emit movement detected event
+    if movement_details:
+        emit_ml_console_event(user_email, 'movement_detected',
+                             f'Significant movement detected ({len(movement_details)} devices)', {
+                                 'movements': movement_details,
+                                 'total_devices_moved': len(movement_details)
+                             })
+    
+    analysis_results = []
     
     for i in range(len(device_list)):
         for j in range(i + 1, len(device_list)):
@@ -540,7 +680,30 @@ def analyze_device_behavior(user_email, device_locations):
             device1['current_section'] = device1_section
             device2['current_section'] = device2_section
             
+            # Emit console event for device pair analysis
+            emit_ml_console_event(user_email, 'device_pair_analysis',
+                                 f'Analyzing device pair: {device1_section} ↔ {device2_section}', {
+                                     'device1': device1['device_id'][:8] + '...',
+                                     'device2': device2['device_id'][:8] + '...',
+                                     'device1_section': device1_section,
+                                     'device2_section': device2_section,
+                                     'distance': calculate_distance(
+                                         device1['latitude'], device1['longitude'],
+                                         device2['latitude'], device2['longitude']
+                                     )
+                                 })
+            
             behavior_record = behavior_analyzer.analyze_device_pair(user_email, device1, device2)
+            analysis_results.append(behavior_record)
+            
+            # Emit console event for behavior record
+            emit_ml_console_event(user_email, 'behavior_record_created',
+                                 'Behavior pattern recorded for analysis', {
+                                     'device_pair': f"{device1_section} ↔ {device2_section}",
+                                     'distance_between_devices': behavior_record.get('distance_between_devices', 0),
+                                     'same_section': behavior_record.get('same_section', False),
+                                     'moving_together': behavior_record.get('moving_together', False)
+                                 })
             
             model_ready = check_and_train_model(user_email)
             
@@ -550,6 +713,17 @@ def analyze_device_behavior(user_email, device_locations):
                         model = user_models[user_email]
                         
                         is_anomaly, confidence, message, anomaly_details = model.predict_anomaly(behavior_record)
+                        
+                        # Emit prediction result to console
+                        emit_ml_console_event(user_email, 'ml_prediction_result',
+                                             f'ML Prediction: {"ANOMALY" if is_anomaly else "Normal"} ({confidence:.2%} confidence)', {
+                                                 'is_anomaly': is_anomaly,
+                                                 'confidence': confidence,
+                                                 'score': anomaly_details.get('score'),
+                                                 'threshold': anomaly_details.get('threshold'),
+                                                 'device1_section': device1_section,
+                                                 'device2_section': device2_section
+                                             })
                         
                         if is_anomaly:
                             print(f"🚨 ANOMALY DETECTED for {user_email}!")
@@ -626,6 +800,31 @@ def analyze_device_behavior(user_email, device_locations):
                                     }, room=user_email)
                                 except Exception as e:
                                     print(f"⚠️ Could not emit individual anomaly: {e}")
+            
+            # Emit console event for pattern learning
+            if not model_ready and behavior_record:
+                emit_ml_console_event(user_email, 'pattern_learning',
+                                     'Learning behavior pattern from device movement', {
+                                         'device_pair': f"{device1_section} ↔ {device2_section}",
+                                         'distance': behavior_record.get('distance_between_devices', 0),
+                                         'movement_speeds': {
+                                             'device1': behavior_record.get('movement_speed_device1', 0),
+                                             'device2': behavior_record.get('movement_speed_device2', 0)
+                                         },
+                                         'same_section': behavior_record.get('same_section', False)
+                                     })
+    
+    # Emit summary console event
+    if analysis_results:
+        emit_ml_console_event(user_email, 'ml_analysis_complete',
+                             f'ML analysis complete: {len(analysis_results)} device pairs analyzed', {
+                                 'total_pairs_analyzed': len(analysis_results),
+                                 'sections_involved': len(set([r.get('device1_section_id', 0) for r in analysis_results] + 
+                                                             [r.get('device2_section_id', 0) for r in analysis_results])),
+                                 'average_distance': sum([r.get('distance_between_devices', 0) for r in analysis_results]) / len(analysis_results) if analysis_results else 0
+                             })
+    
+    return analysis_results
 
 def token_required(f):
     def decorated(*args, **kwargs):
@@ -733,6 +932,15 @@ def handle_disconnect():
         if connection:
             device_id = connection['device_id']
             user_email = connection.get('user_email')
+            
+            # Emit console event for disconnection
+            if user_email:
+                emit_ml_console_event(user_email, 'websocket_disconnected',
+                                     f'Device disconnected: {device_id[:8]}...', {
+                                         'device_id': device_id,
+                                         'socket_id': request.sid,
+                                         'timestamp': datetime.datetime.utcnow().isoformat()
+                                     })
             
             device_connections_collection.delete_one({'socket_id': request.sid})
             print(f"🗑️ Removed connection for device {device_id[:8] if device_id else 'unknown'}...")
@@ -871,6 +1079,15 @@ def handle_join_room(data):
         join_room(user_email)
         print(f'✅ Device {device_id[:20]} for user {user_email} joined room')
         
+        # Emit console event for successful join
+        emit_ml_console_event(user_email, 'websocket_connected',
+                             f'Device connected: {device_id[:8]}...', {
+                                 'device_id': device_id,
+                                 'device_name': device_exists.get('device_name', 'Unknown'),
+                                 'socket_id': request.sid,
+                                 'timestamp': datetime.datetime.utcnow().isoformat()
+                             })
+        
         # Get device info
         device_info = devices_collection.find_one({'device_id': device_id})
         device_name = device_info.get('device_name', 'Unknown Device') if device_info else 'Unknown Device'
@@ -961,6 +1178,20 @@ def handle_join_room(data):
                     'training_samples': training_status.get('training_samples', 0),
                     'message': training_status.get('message', '')
                 })
+                
+                # Emit console event for ML status
+                if training_status.get('is_training'):
+                    emit_ml_console_event(user_email, 'ml_status_update',
+                                         'ML Training in progress', {
+                                             'training_samples': training_status.get('training_samples', 0),
+                                             'is_trained': training_status.get('is_trained', False)
+                                         })
+                elif training_status.get('is_trained'):
+                    emit_ml_console_event(user_email, 'ml_status_update',
+                                         'ML Model is trained and active', {
+                                             'training_samples': training_status.get('training_samples', 0),
+                                             'is_trained': True
+                                         })
             except Exception as e:
                 print(f"⚠️ Could not emit ML status: {e}")
         else:
@@ -973,6 +1204,13 @@ def handle_join_room(data):
                         'training_samples': 0,
                         'message': 'Ready to start ML training with 2+ devices'
                     })
+                    
+                    # Emit console event for ML ready status
+                    emit_ml_console_event(user_email, 'ml_ready',
+                                         'ML system ready to start training (2+ devices detected)', {
+                                             'device_count': len(user.get('devices', [])),
+                                             'status': 'ready'
+                                         })
                 except Exception as e:
                     print(f"⚠️ Could not emit ML ready status: {e}")
         
@@ -1046,6 +1284,16 @@ def handle_location_update(data):
         
         if not is_valid:
             print(f"⚠️ Location rejected: {reason}")
+            
+            # Emit console event for rejected location
+            emit_ml_console_event(user_email, 'location_rejected',
+                                 f'Location rejected for device {device_id[:8]}...', {
+                                     'device_id': device_id,
+                                     'reason': reason,
+                                     'original_accuracy': acc,
+                                     'coordinates': {'lat': raw_lat, 'lng': raw_lng}
+                                 })
+            
             try:
                 socketio.emit('location_rejected', {
                     'device_id': device_id,
@@ -1069,6 +1317,24 @@ def handle_location_update(data):
         if university_data and 'sections' in university_data:
             current_section = detect_section(validated_lat, validated_lng, university_data['sections'])
         
+        # Check if section changed
+        last_location = locations_collection.find_one(
+            {'device_id': device_id},
+            sort=[('timestamp', -1)]
+        )
+        section_changed = False
+        if last_location and last_location.get('current_section') != current_section:
+            section_changed = True
+            # Emit console event for section change
+            emit_ml_console_event(user_email, 'section_change',
+                                 f'Device moved to {current_section}', {
+                                     'device_id': device_id,
+                                     'device_name': device_name,
+                                     'from_section': last_location.get('current_section', 'Unknown'),
+                                     'to_section': current_section,
+                                     'coordinates': {'lat': validated_lat, 'lng': validated_lng}
+                                 })
+        
         # Store in locations collection
         location_data = {
             'device_id': device_id,
@@ -1085,6 +1351,19 @@ def handle_location_update(data):
         }
         
         locations_collection.insert_one(location_data)
+        
+        # Emit console event for location update
+        emit_ml_console_event(user_email, 'gps_update',
+                             f'GPS update: {device_name} in {current_section}', {
+                                 'device_id': device_id,
+                                 'device_name': device_name,
+                                 'latitude': validated_lat,
+                                 'longitude': validated_lng,
+                                 'accuracy': validated_acc,
+                                 'current_section': current_section,
+                                 'validation_reason': reason,
+                                 'section_changed': section_changed
+                             })
         
         # Update device_locations for real-time tracking
         device_locations_collection.update_one(
@@ -1155,6 +1434,14 @@ def handle_location_update(data):
                         user_devices_locations[dev_id] = loc
                 
                 if len(user_devices_locations) >= 2:
+                    # Emit console event for ML trigger
+                    emit_ml_console_event(user_email, 'ml_trigger',
+                                         'ML analysis triggered by device movement', {
+                                             'device_count': len(user_devices_locations),
+                                             'trigger_device': device_id[:8] + '...',
+                                             'section': current_section
+                                         })
+                    
                     # Start ML analysis in background
                     import threading
                     thread = threading.Thread(
@@ -1169,6 +1456,31 @@ def handle_location_update(data):
     except Exception as e:
         print(f"❌ Error in update_location: {str(e)}")
         traceback.print_exc()
+
+# ================ ADD NEW SOCKET.IO EVENT HANDLER FOR CONSOLE ================
+
+@socketio.on('ml_console_event')
+def handle_ml_console_event(data):
+    """Handle ML console events from frontend - NEW HANDLER"""
+    try:
+        user_email = data.get('user_email')
+        event_type = data.get('type')
+        message = data.get('message')
+        event_data = data.get('data', {})
+        
+        if user_email and event_type:
+            # Forward to all clients in the user's room
+            socketio.emit('ml_console_event', {
+                'type': event_type,
+                'message': message,
+                'data': event_data,
+                'timestamp': datetime.datetime.utcnow().isoformat(),
+                'source': 'frontend'
+            }, room=user_email)
+            
+            print(f"📊 ML Console Event from frontend for {user_email}: {event_type} - {message}")
+    except Exception as e:
+        print(f"⚠️ Error handling ML console event: {e}")
 
 # ================ REST API ENDPOINTS ================
 
@@ -1202,7 +1514,8 @@ def health_check():
             'cache_size': len(last_location_cache),
             'multi_device_support': True,
             'device_id_fix': 'APPLIED_V3',
-            'no_auto_device_creation': True  # ✅ Added flag
+            'no_auto_device_creation': True,
+            'ml_console_logging': 'ENABLED'  # ✅ New flag
         }), 200
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
@@ -1413,6 +1726,15 @@ def add_device(current_user):
         
         print(f"✅ Device added: {device_id[:20]}... to {current_user['email']}")
         
+        # Emit console event for device addition
+        emit_ml_console_event(current_user['email'], 'device_added',
+                             f'New device added: {device_name}', {
+                                 'device_id': device_id,
+                                 'device_name': device_name,
+                                 'os': os,
+                                 'browser': browser
+                             })
+        
         device_status = {
             'device_id': device_id,
             'device_exists': True,
@@ -1430,6 +1752,13 @@ def add_device(current_user):
         if device_count >= 2:
             print(f"🤖 User has {device_count} devices - ML training can start")
             ml_training_started = True
+            
+            # Emit console event for ML ready status
+            emit_ml_console_event(current_user['email'], 'ml_ready',
+                                 'ML system now has 2+ devices - ready for training', {
+                                     'device_count': device_count,
+                                     'status': 'ready_for_training'
+                                 })
         
         return jsonify({
             'message': 'Device added successfully',
@@ -1531,6 +1860,14 @@ def grant_location_permission(current_user):
                 
                 university_collection.insert_one(university_data)
                 print(f"🏛️ University created at {center_lat}, {center_lon}")
+                
+                # Emit console event for university creation
+                emit_ml_console_event(current_user['email'], 'university_created',
+                                     'University layout created', {
+                                         'center': {'lat': center_lat, 'lon': center_lon},
+                                         'sections_count': len(sections),
+                                         'sections': [s['name'] for s in sections]
+                                     })
             except ValueError:
                 return jsonify({'error': 'Invalid coordinates'}), 400
         
@@ -1543,6 +1880,14 @@ def grant_location_permission(current_user):
             {'device_id': device_id},
             {'$set': {'location_tracking': True}}
         )
+        
+        # Emit console event for permission granted
+        emit_ml_console_event(current_user['email'], 'location_permission_granted',
+                             'Location permission granted', {
+                                 'device_id': device_id,
+                                 'device_name': device.get('device_name', 'Unknown'),
+                                 'university_created': university_exists is None
+                             })
         
         university_data = university_collection.find_one({'user_email': current_user['email']})
         
@@ -1773,7 +2118,9 @@ def system_status(current_user):
             'timestamp': datetime.datetime.utcnow().isoformat(),
             'multi_device_active': True,
             'device_id_fix': 'APPLIED_V3',
-            'no_auto_device_creation': True  # ✅ Added flag
+            'no_auto_device_creation': True,
+            'ml_console_logging': 'ENABLED',
+            'ml_events_emitted': 'YES'  # ✅ New flag
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1874,6 +2221,15 @@ def simulate_location(current_user):
             else:
                 return jsonify({'error': 'No device found for user'}), 400
         
+        # Emit console event for simulated location
+        emit_ml_console_event(current_user['email'], 'simulated_location',
+                             f'Simulated location sent for device {device_id[:8]}...', {
+                                 'device_id': device_id,
+                                 'latitude': latitude,
+                                 'longitude': longitude,
+                                 'accuracy': accuracy
+                             })
+        
         # Create simulated location update
         update_data = {
             'device_id': device_id,
@@ -1945,6 +2301,12 @@ def force_connect(current_user):
     if not device_id:
         return jsonify({'error': 'Device ID required'}), 400
     
+    # Emit console event for force connect
+    emit_ml_console_event(current_user['email'], 'force_connect',
+                         f'Force reconnection requested for device {device_id[:8]}...', {
+                             'device_id': device_id
+                         })
+    
     # Clean up any existing connection
     device_connections_collection.delete_one({'device_id': device_id})
     
@@ -1953,6 +2315,25 @@ def force_connect(current_user):
         'message': 'Connection cleaned up. Please reconnect from frontend.',
         'device_id': device_id
     })
+
+@app.route('/api/ml-console-test', methods=['POST'])
+@token_required
+def ml_console_test(current_user):
+    """Test ML console events"""
+    try:
+        event_type = request.json.get('event_type', 'test_event')
+        message = request.json.get('message', 'Test console event')
+        data = request.json.get('data', {'test': True})
+        
+        emit_ml_console_event(current_user['email'], event_type, message, data)
+        
+        return jsonify({
+            'success': True,
+            'message': f'ML console test event sent: {event_type}',
+            'user_email': current_user['email']
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
@@ -1967,6 +2348,11 @@ if __name__ == '__main__':
     print(f"🏛️ University system enabled - 12x12 meter sections")
     print(f"🤖 ENHANCED ML Anomaly Detection: Active")
     print(f"🌐 WebSocket enabled with threading mode")
+    print(f"📊 ENHANCED ML CONSOLE LOGGING: ENABLED")
+    print(f"   - Real-time ML event emission")
+    print(f"   - Device movement tracking")
+    print(f"   - Pattern learning visualization")
+    print(f"   - Anomaly detection alerts")
     print(f"🛡️ CRITICAL DEVICE REGISTRATION FIX APPLIED:")
     print(f"   - REMOVED auto-device creation from join_room handler")
     print(f"   - Devices ONLY created via /api/add-device endpoint")
@@ -1985,9 +2371,19 @@ if __name__ == '__main__':
     print(f"   5. WebSocket join_room → Validates device registration")
     print(f"   6. Location permission requested → Tracking enabled")
     print(f"   7. 2+ devices → ML learning starts automatically")
+    print(f"📊 ML Console Events:")
+    print(f"   - device_added: When new device is registered")
+    print(f"   - websocket_connected: When device connects")
+    print(f"   - gps_update: When location is updated")
+    print(f"   - section_change: When device moves between sections")
+    print(f"   - ml_training_started: When ML training begins")
+    print(f"   - ml_training_progress: During training")
+    print(f"   - ml_training_complete: When training finishes")
+    print(f"   - anomaly_detected: When unusual behavior is found")
     print(f"🔍 Debug endpoints available:")
     print(f"   - /api/test-device-id")
     print(f"   - /api/simulate-location")
     print(f"   - /api/force-connect")
+    print(f"   - /api/ml-console-test (NEW)")
     
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
